@@ -1,14 +1,20 @@
 """Tools for todo management with memory integration and improved system prompts."""
 
-from typing import List, Dict, Any, Optional
+from typing import List, Optional, Dict, Any, Union
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 import json
 import re
 import logging
+import uuid
+import time
 from langchain_core.tools import BaseTool
+from langchain.chat_models import init_chat_model
 from pydantic import BaseModel, Field
 from mem0 import Memory
+from qdrant_client import QdrantClient
+from qdrant_client.models import PointStruct
+import requests
 
 # Set up logger for this module
 logger = logging.getLogger(__name__)
@@ -42,28 +48,7 @@ class CreateTodosInput(BaseModel):
 
 
 class TodoManagerTool(BaseTool):
-    """Advanced todo creation and management tool with intelligent parsing.
-    
-    SYSTEM PROMPT: You are an expert todo extraction assistant. Your job is to:
-    
-    1. PARSE user requests and extract individual actionable todo items
-    2. STRUCTURE each todo with proper priority, due dates, and categorization  
-    3. STORE todos in memory for future retrieval
-    4. PROVIDE clear confirmation of what was created
-    
-    PARSING RULES:
-    - Extract multiple todos from sentences containing 'and', numbered lists, or bullet points
-    - Identify priority keywords: "urgent", "asap" = high; "when possible", "eventually" = low
-    - Detect due dates: "by Friday", "tomorrow", "next week", etc.
-    - Auto-categorize with tags: work, personal, home, shopping, calls, etc.
-    
-    EXAMPLES:
-    ✅ "Add buy groceries and call mom" → 2 separate todos
-    ✅ "I need to: 1. Review code 2. Send email" → 2 numbered todos  
-    ✅ "Urgent: finish report by Friday" → high priority with due date
-    
-    ALWAYS confirm what you created and provide todo IDs for reference.
-    """
+    """Advanced todo creation and management tool with intelligent parsing using multiple LLM queries."""
 
     name: str = "todo_manager"
     description: str = """Create and manage multiple todo items from natural language input with intelligent parsing.
@@ -84,9 +69,15 @@ class TodoManagerTool(BaseTool):
 
     def __init__(self, memory: Memory, **kwargs):
         super().__init__(**kwargs)
-        # Use private attribute to avoid Pydantic field validation issues
         self._memory = memory
-        self._todo_counter = 1
+        # Initialize LLM for multi-step extraction
+        self._llm = init_chat_model(model="llama3.1:8b-instruct-q8_0", model_provider="ollama")
+        
+        # Initialize direct Qdrant client for bypassing Mem0
+        self._qdrant_client = QdrantClient(host="localhost", port=6333)
+        
+        # Initialize embedding model for manual embeddings
+        self._embedding_url = "http://localhost:11434/api/embeddings"
 
     @property
     def memory(self) -> Memory:
@@ -95,153 +86,337 @@ class TodoManagerTool(BaseTool):
             raise RuntimeError("Memory not properly initialized in TodoManagerTool")
         return self._memory
 
-    def _extract_todos_from_text(self, text: str) -> List[Dict[str, Any]]:
-        """Extract todo items from natural language text using LLM parsing."""
-        todos = []
-        logger.info(f"EXTRACTING TODOS from text: '{text}'")
-
-        # Simple approach: split on common separators and clean up
-        # The LLM calling this tool has already understood the intent
+    def _clean_llm_response(self, response_text: str) -> List[str]:
+        """Clean LLM response by removing headers, meta-text, and explanations."""
+        lines = response_text.strip().split('\n')
+        cleaned_lines = []
         
-        # Strategy 1: Look for common separators
-        potential_items = []
-        
-        # Split on commas and "and" 
-        items = re.split(r',\s*(?:and\s+)?|\s+and\s+', text)
-        
-        for item in items:
-            # Clean up each item
-            cleaned = re.sub(
-                r'(?:^|\s+)(?:remind me to|i (?:also )?need to|i (?:also )?have to|i (?:also )?should|i (?:also )?must)\s+',
-                '', item, flags=re.IGNORECASE
-            ).strip()
-            
-            # Remove leading/trailing punctuation but keep internal punctuation
-            cleaned = re.sub(r'^[,\.\s]+|[,\.\s]+$', '', cleaned).strip()
-            
-            if len(cleaned) > 2:  # Only keep meaningful items
-                potential_items.append(cleaned)
-
-        # If no good splits found, try to extract the main action from the whole text
-        if not potential_items:
-            # Remove common prefixes and use the rest
-            cleaned = re.sub(
-                r'(?:^|\s+)(?:add|create|make|todo|task|remind me to|i need to|i have to|i should|i must)\s+',
-                '', text, flags=re.IGNORECASE
-            ).strip()
-            if len(cleaned) > 2:
-                potential_items.append(cleaned)
-
-        logger.info(f"Extracted items: {potential_items}")
-
-        # Convert to structured todos
-        for item in potential_items:
-            if not item.strip():
+        for line in lines:
+            line = line.strip()
+            if not line:
                 continue
                 
-            # Simple priority detection
-            priority = "medium"
-            if any(word in item.lower() for word in ["urgent", "asap", "critical", "emergency"]):
-                priority = "high"
-            elif any(word in item.lower() for word in ["eventually", "sometime", "later"]):
-                priority = "low"
+            # Skip common LLM headers and meta-text
+            skip_patterns = [
+                r'^here\s+are?\s+',
+                r'^here\s+is\s+',
+                r'^the\s+following\s+',
+                r'^extracted?\s+',
+                r'^tasks?:?\s*$',
+                r'^priorities?:?\s*$',
+                r'^due\s+dates?:?\s*$',
+                r'^tags?:?\s*$',
+                r'^timeframes?:?\s*$',
+                r'^\d+\.\s*$',  # Just numbers like "1."
+                r'^output:?\s*$',
+                r'^result:?\s*$',
+                r'^answer:?\s*$',
+                r'actionable\s+tasks?',
+                r'extracted?\s+tasks?',
+                r'individual\s+tasks?',
+                r'task\s+extract',
+                r'extract.*task',
+            ]
+            
+            # Check if line matches any skip pattern
+            should_skip = any(re.match(pattern, line.lower()) for pattern in skip_patterns)
+            
+            if not should_skip and len(line) > 1:
+                cleaned_lines.append(line)
+        
+        return cleaned_lines
 
-            # Simple due date extraction
-            due_date = None
-            if re.search(r'by\s+\w+|today|tomorrow|this week|next week', item.lower()):
-                due_match = re.search(r'(by\s+\w+|today|tomorrow|this week|next week)', item.lower())
-                if due_match:
-                    due_date = due_match.group(1)
+    def _extract_tasks_llm(self, text: str) -> List[str]:
+        """Extract individual tasks using LLM."""
+        prompt = f"""Extract actionable tasks from: "{text}"
 
-            # Simple tag detection
-            tags = []
-            tag_keywords = {
-                "work": ["work", "project", "meeting", "report", "email"],
-                "personal": ["mom", "family", "friend", "call"],
-                "home": ["clean", "fix", "house"],
-                "shopping": ["buy", "grocery", "store"],
+Return ONLY the task text, one per line. NO headers or explanations.
+
+Examples:
+Input: "buy groceries and call mom" 
+Output:
+buy groceries
+call mom"""
+
+        response = self._llm.invoke([{"role": "user", "content": prompt}])
+        response_text = response.content if hasattr(response, 'content') else str(response)
+        if not isinstance(response_text, str):
+            response_text = str(response_text)
+        
+        # Clean the response
+        tasks = self._clean_llm_response(response_text)
+        
+        # Fallback: simple split if LLM didn't work properly
+        if not tasks:
+            text_clean = re.sub(r'(?:i need to|remind me to|add|create)\s+', '', text, flags=re.IGNORECASE).strip()
+            parts = re.split(r',\s*(?:and\s+)?|\s+and\s+|\d+\.\s*', text_clean)
+            for part in parts:
+                clean_part = part.strip().strip('.,')
+                if clean_part and len(clean_part) > 2:
+                    tasks.append(clean_part)
+            if not tasks:
+                tasks = [text.strip()]
+        
+        return tasks
+
+    def _extract_priorities_llm(self, tasks: List[str]) -> List[str]:
+        """Extract priority for each task using LLM."""
+        tasks_text = '\n'.join(f"{i+1}. {task}" for i, task in enumerate(tasks))
+        
+        prompt = f"""For each task, return ONLY: high, medium, or low
+
+Tasks:
+{tasks_text}
+
+Rules:
+- HIGH: urgent, ASAP, critical, emergency
+- LOW: later, eventually, when possible
+- MEDIUM: default
+
+Return one word per line:"""
+
+        response = self._llm.invoke([{"role": "user", "content": prompt}])
+        response_text = response.content if hasattr(response, 'content') else str(response)
+        if not isinstance(response_text, str):
+            response_text = str(response_text)
+        
+        # Clean and parse priorities
+        lines = self._clean_llm_response(response_text)
+        priorities = []
+        for line in lines:
+            priority = line.strip().lower()
+            if priority in ['high', 'medium', 'low']:
+                priorities.append(priority)
+        
+        # Fill missing with medium
+        while len(priorities) < len(tasks):
+            priorities.append('medium')
+            
+        return priorities[:len(tasks)]
+
+    def _extract_due_dates_llm(self, tasks: List[str]) -> List[Optional[str]]:
+        """Extract due dates for each task using LLM."""
+        tasks_text = '\n'.join(f"{i+1}. {task}" for i, task in enumerate(tasks))
+        
+        prompt = f"""For each task, return timeframe or "none"
+
+Tasks:
+{tasks_text}
+
+Look for: tomorrow, today, Friday, next week, ASAP
+
+Return one per line:"""
+
+        response = self._llm.invoke([{"role": "user", "content": prompt}])
+        response_text = response.content if hasattr(response, 'content') else str(response)
+        if not isinstance(response_text, str):
+            response_text = str(response_text)
+        
+        # Clean and parse due dates
+        lines = self._clean_llm_response(response_text)
+        due_dates = []
+        for line in lines:
+            due_date = line.strip()
+            if due_date.lower() == 'none':
+                due_dates.append(None)
+            else:
+                # Additional filtering for due dates
+                if not re.match(r'^(here|the|extracted|timeframes?)', due_date.lower()):
+                    due_dates.append(due_date)
+                else:
+                    due_dates.append(None)
+        
+        # Fill missing with None
+        while len(due_dates) < len(tasks):
+            due_dates.append(None)
+            
+        return due_dates[:len(tasks)]
+
+    def _extract_tags_llm(self, tasks: List[str]) -> List[List[str]]:
+        """Extract relevant tags for each task using LLM."""
+        tasks_text = '\n'.join(f"{i+1}. {task}" for i, task in enumerate(tasks))
+        
+        prompt = f"""For each task, return tags or "none"
+
+Tasks:
+{tasks_text}
+
+Tags: work, personal, home, shopping, health, finance, social, travel, learning, maintenance
+
+Return tags separated by commas, one line per task:"""
+
+        response = self._llm.invoke([{"role": "user", "content": prompt}])
+        response_text = response.content if hasattr(response, 'content') else str(response)
+        if not isinstance(response_text, str):
+            response_text = str(response_text)
+        
+        # Clean and parse tags
+        lines = self._clean_llm_response(response_text)
+        all_tags = []
+        valid_tags = {'work', 'personal', 'home', 'shopping', 'health', 'finance', 'social', 'travel', 'learning', 'maintenance'}
+        
+        for line in lines:
+            line = line.strip()
+            if line.lower() == 'none':
+                all_tags.append([])
+            else:
+                tags = []
+                for tag in line.split(','):
+                    tag = tag.strip().lower()
+                    if tag in valid_tags:
+                        tags.append(tag)
+                all_tags.append(tags)
+        
+        # Fill missing with empty lists
+        while len(all_tags) < len(tasks):
+            all_tags.append([])
+            
+        return all_tags[:len(tasks)]
+
+    def _get_embedding(self, text: str) -> List[float]:
+        """Get embedding for text using Ollama."""
+        try:
+            response = requests.post(self._embedding_url, json={
+                "model": "bge-m3:latest",
+                "prompt": text
+            })
+            response.raise_for_status()
+            return response.json()["embedding"]
+        except Exception as e:
+            logger.error(f"Failed to get embedding: {e}")
+            # Return zero vector as fallback
+            return [0.0] * 1024
+    
+    def _store_todo_direct(self, todo: Dict[str, Any], user_id: str) -> Dict[str, Any]:
+        """Store todo directly in Qdrant bypassing Mem0 fact extraction."""
+        try:
+            # Create embedding from todo content
+            content = f"Todo: {todo['title']} - {todo['description']} - Priority: {todo['priority']} - Tags: {','.join(todo['tags'])}"
+            embedding = self._get_embedding(content)
+            
+            # Prepare point for Qdrant
+            point_id = todo["uuid"]  # Use proper UUID as the point ID
+            
+            payload = {
+                "type": "todo_item_direct",
+                "user_id": user_id,
+                "todo_id": todo["id"],
+                "title": todo["title"],
+                "description": todo["description"],
+                "priority": todo["priority"],
+                "due_date": todo["due_date"],
+                "completed": todo["completed"],
+                "tags": todo["tags"],
+                "created_at": todo["created_at"],
+                "content": content  # For searchability
             }
             
-            item_lower = item.lower()
-            for tag, keywords in tag_keywords.items():
-                if any(keyword in item_lower for keyword in keywords):
-                    tags.append(tag)
-
-            # Generate unique ID
-            todo_id = f"todo_{self._todo_counter:04d}"
-            self._todo_counter += 1
-
-            todos.append({
-                "id": todo_id,
-                "title": item.strip()[:100],
-                "description": item.strip(),
-                "priority": priority,
-                "due_date": due_date,
-                "completed": False,
-                "created_at": datetime.now().isoformat(),
-                "tags": tags,
-            })
-
-        logger.info(f"Final todos: {[t['title'] for t in todos]}")
-        return todos
+            # Store directly in Qdrant
+            self._qdrant_client.upsert(
+                collection_name="todo_memories",
+                points=[
+                    PointStruct(
+                        id=point_id,
+                        vector=embedding,
+                        payload=payload
+                    )
+                ]
+            )
+            
+            logger.info(f"Stored todo {todo['id']} directly in Qdrant")
+            return {"success": True, "id": point_id}
+            
+        except Exception as e:
+            logger.error(f"Failed to store todo {todo['id']} directly: {e}")
+            return {"success": False, "error": str(e)}
 
     def _run(self, user_input: str, user_id: str) -> str:
-        """Execute the tool to create todo items with enhanced feedback."""
+        """Execute the tool to create todo items with enhanced multi-LLM extraction."""
         try:
-            # Extract todos from the input
-            extracted_todos = self._extract_todos_from_text(user_input)
-
-            if not extracted_todos:
+            logger.info(f"Processing todo creation for user {user_id}: {user_input}")
+            
+            # Step 1: Extract individual tasks
+            tasks = self._extract_tasks_llm(user_input)
+            if not tasks:
                 return json.dumps({
                     "status": "no_todos_extracted",
                     "message": "No actionable todo items found in your request",
                     "user_input": user_input,
-                    "suggestions": [
-                        "Add buy groceries to my todos",
-                        "Create task: finish report by Friday",
-                        "I need to: 1. Call doctor 2. Pay bills",
-                        "Remind me to walk the dog and feed the cat"
-                    ]
                 })
 
-            # Store in memory with structured data
-            memory_content = f"User created {len(extracted_todos)} todo items"
-            todo_titles = [todo["title"] for todo in extracted_todos]
+            # Step 2: Extract priorities, due dates, and tags in parallel
+            priorities = self._extract_priorities_llm(tasks)
+            due_dates = self._extract_due_dates_llm(tasks)
+            tags_list = self._extract_tags_llm(tasks)
+
+            # Step 3: Create structured todos
+            extracted_todos = []
+            for i, task in enumerate(tasks):
+                todo_uuid = uuid.uuid4()
+                todo_id = f"todo_{todo_uuid.hex[:8]}"  # Keep this for display
+                
+                extracted_todos.append({
+                    "id": todo_id,
+                    "uuid": str(todo_uuid),  # Proper UUID for Qdrant point ID
+                    "title": task.strip()[:100],
+                    "description": task.strip(),
+                    "priority": priorities[i] if i < len(priorities) else "medium",
+                    "due_date": due_dates[i] if i < len(due_dates) else None,
+                    "completed": False,
+                    "created_at": datetime.now().isoformat(),
+                    "tags": tags_list[i] if i < len(tags_list) else [],
+                })
+
+            logger.info(f"Extracted {len(extracted_todos)} todos: {[t['title'] for t in extracted_todos]}")
+
+            # Store each todo as a separate memory entry
+            memory_results = []
             
-            # Prepare memory add operation
-            messages = [
-                {"role": "user", "content": user_input},
-                {"role": "assistant", "content": f"Created {len(extracted_todos)} todos: {', '.join(todo_titles)}"}
+            for i, todo in enumerate(extracted_todos):
+                logger.info(f"[{i+1}/{len(extracted_todos)}] Storing todo '{todo['title']}' with ID {todo['id']}")
+                
+                # Store directly in Qdrant bypassing Mem0
+                direct_result = self._store_todo_direct(todo, user_id)
+                memory_results.append(direct_result)
+                
+                time.sleep(0.1)  # Small delay
+
+            # Compute summary statistics first
+            priority_counts = {"high": 0, "medium": 0, "low": 0}
+            due_date_count = 0
+            all_tags = set()
+            
+            for todo in extracted_todos:
+                priority_counts[todo["priority"]] += 1
+                if todo["due_date"]:
+                    due_date_count += 1
+                all_tags.update(todo["tags"])
+
+            # Store summary with delay to ensure individual todos are processed first
+            time.sleep(0.1)  # Small delay to let individual todos be processed
+            
+            summary_messages = [
+                {"role": "user", "content": f"BATCH_SUMMARY: Created {len(extracted_todos)} todos from: {user_input}"},
+                {"role": "assistant", "content": f"BATCH_COMPLETE: Successfully created batch of {len(extracted_todos)} todos with IDs: {', '.join([t['id'] for t in extracted_todos])}"}
             ]
-            metadata = {
-                "type": "todo_creation",
+            summary_metadata = {
+                "type": "todo_batch_creation",
                 "todo_count": len(extracted_todos),
                 "todo_ids": [todo["id"] for todo in extracted_todos],
-                "todo_titles": todo_titles,
-                "priority_distribution": {
-                    "high": len([t for t in extracted_todos if t["priority"] == "high"]),
-                    "medium": len([t for t in extracted_todos if t["priority"] == "medium"]), 
-                    "low": len([t for t in extracted_todos if t["priority"] == "low"])
-                },
-                "has_due_dates": len([t for t in extracted_todos if t["due_date"]]),
-                "tags": list(set([tag for todo in extracted_todos for tag in todo["tags"]])),
-                "created_at": datetime.now().isoformat()
+                "priority_distribution": priority_counts,
+                "has_due_dates": due_date_count,
+                "unique_tags": list(all_tags),
+                "created_at": datetime.now().isoformat(),
+                "batch_id": f"batch_{user_id}_{datetime.now().timestamp()}"  # Unique batch ID
             }
             
-            # Log the memory add operation
-            logger.info(f"MEMORY ADD - User: {user_id}, Messages: {messages}, Metadata: {metadata}")
-            
-            # Store with rich metadata for better retrieval
-            memory_result = self.memory.add(
-                messages=messages,
+            summary_result = self.memory.add(
+                messages=summary_messages,
                 user_id=user_id,
-                metadata=metadata,
+                metadata=summary_metadata,
             )
-            
-            # Log the response
-            logger.info(f"MEMORY ADD RESPONSE: {memory_result}")
 
-            # Return structured data instead of formatted response
+            # Return structured data
             result_data = {
                 "status": "success",
                 "action": "todos_created",
@@ -252,15 +427,16 @@ class TodoManagerTool(BaseTool):
                 "todos": extracted_todos,
                 "summary": {
                     "total": len(extracted_todos),
-                    "priorities": metadata["priority_distribution"],
-                    "with_due_dates": metadata["has_due_dates"],
-                    "tags": metadata["tags"]
+                    "priorities": priority_counts,
+                    "with_due_dates": due_date_count,
+                    "tags": list(all_tags)
                 }
             }
             
             return json.dumps(result_data, indent=2)
 
         except Exception as e:
+            logger.error(f"Error in todo creation: {str(e)}")
             return json.dumps({
                 "status": "error",
                 "action": "todo_creation_failed",
@@ -393,21 +569,22 @@ class ListTodosTool(BaseTool):
                 if not isinstance(metadata, dict):
                     continue
                 
-                # Handle todo creation records
-                if metadata.get("type") == "todo_creation":
-                    todo_ids = metadata.get("todo_ids", [])
-                    todo_titles = metadata.get("todo_titles", [])
-                    created_at = metadata.get("created_at", "")
+                # Handle individual todo items
+                if metadata.get("type") == "todo_item":
+                    todo_id = metadata.get("todo_id")
+                    title = metadata.get("title", "")
                     
-                    # Extract todos from metadata
-                    for todo_id, title in zip(todo_ids, todo_titles):
-                        if title and title.strip() and len(title.strip()) > 1:  # Valid title
-                            all_todos.append({
-                                "id": todo_id,
-                                "title": title.strip(),
-                                "completed": False,
-                                "created_at": created_at
-                            })
+                    if todo_id and title and title.strip():
+                        all_todos.append({
+                            "id": todo_id,
+                            "title": title.strip(),
+                            "description": metadata.get("description", ""),
+                            "priority": metadata.get("priority", "medium"),
+                            "due_date": metadata.get("due_date"),
+                            "completed": metadata.get("completed", False),
+                            "tags": metadata.get("tags", []),
+                            "created_at": metadata.get("created_at", "")
+                        })
                 
                 # Handle completion records
                 elif metadata.get("type") == "todo_completion":

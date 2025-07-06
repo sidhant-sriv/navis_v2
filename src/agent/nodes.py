@@ -85,10 +85,22 @@ async def chatbot_node(state: TodoAgentState, config: RunnableConfig) -> Dict[st
     # Get messages from state
     messages = state.get("messages", [])
     
-    # Check if we just received tool results - if so, provide final response without more tools
-    has_recent_tool_results = any(msg.type == "tool" for msg in messages[-3:])
-    if has_recent_tool_results:
-        print("DEBUG: Detected recent tool results, generating final response without tools")
+    # Check if we just received tool results - only disable tools if the most recent message is a tool result
+    # If the most recent message is human, we should allow tools regardless of history
+    most_recent_message = messages[-1] if messages else None
+    has_immediate_tool_results = (
+        most_recent_message and 
+        most_recent_message.type == "tool"
+    )
+    
+    # Reset processing state for new human messages
+    is_new_human_message = (
+        most_recent_message and 
+        most_recent_message.type == "human"
+    )
+    
+    if has_immediate_tool_results:
+        print("DEBUG: Most recent message is tool result, generating final response without tools")
         # Use LLM without tools to generate final response
         llm = init_chat_model(
             model=agent_config.ollama.model,
@@ -200,7 +212,7 @@ Always use proper tool calling format and format the tool results nicely for the
                             "messages": [ai_response],
                             "user_id": user_id,
                             "processing_complete": False,
-                            "todo_results": {"aggressive_parsed": tool_name}
+                            "todo_results": {"aggressive_parsed": tool_name} if not is_new_human_message else None
                         }
                         
                 except Exception as e:
@@ -220,7 +232,7 @@ Always use proper tool calling format and format the tool results nicely for the
                     "messages": [ai_response],
                     "user_id": user_id,
                     "processing_complete": False,
-                    "todo_results": {"forced_tool": "list_todos"}
+                    "todo_results": {"forced_tool": "list_todos"} if not is_new_human_message else None
                 }
             elif ("call todo_manager" in content_lower or "to create todos" in content_lower):
                 # Get the original user message to pass to todo_manager
@@ -242,7 +254,7 @@ Always use proper tool calling format and format the tool results nicely for the
                         "messages": [ai_response],
                         "user_id": user_id,
                         "processing_complete": False,
-                        "todo_results": {"forced_tool": "todo_manager"}
+                        "todo_results": {"forced_tool": "todo_manager"} if not is_new_human_message else None
                     }
             
             # Parse raw tool call format like <|python_tag|>{"name": "list_todos", "parameters": {"user_id":"default"}}
@@ -378,7 +390,7 @@ Always use proper tool calling format and format the tool results nicely for the
                     "messages": [ai_response],
                     "user_id": user_id,
                     "processing_complete": False,
-                    "todo_results": {"parsed_tool": tool_name}
+                    "todo_results": {"parsed_tool": tool_name} if not is_new_human_message else None
                 }
         
         # Check if response has tool calls (only AIMessage has this attribute)
@@ -391,7 +403,7 @@ Always use proper tool calling format and format the tool results nicely for the
             "messages": [response],
             "user_id": user_id,
             "processing_complete": not has_tool_calls,
-            "todo_results": {"last_action": "chatbot_processing"}
+            "todo_results": {"last_action": "chatbot_processing"} if not is_new_human_message else None
         }
         
     except Exception as e:
