@@ -77,7 +77,7 @@ def test_vector_search():
     print("=" * 50)
     
     # Test query
-    query_text = "What about to do items related to technical stuff in general"
+    query_text = "Show me all the tasks related "
     
     try:
         # 1. Check Qdrant collection

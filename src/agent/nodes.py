@@ -43,11 +43,17 @@ def clean_tool_params(params: Dict[str, Any]) -> Dict[str, Any]:
             value != '' and 
             str(value).lower() != 'null'):
             
-            # Special handling for boolean fields
+            # Special handling for boolean fields - enhanced to handle more formats
             if key in ['filter_completed'] and isinstance(value, str):
-                if value.lower() in ['true', 'false']:
-                    cleaned_params[key] = value.lower() == 'true'
-                # Skip invalid boolean strings
+                value_lower = value.lower().strip()
+                if value_lower in ['true', '1', 'yes', 'on']:
+                    cleaned_params[key] = True
+                elif value_lower in ['false', '0', 'no', 'off']:
+                    cleaned_params[key] = False
+                # Skip invalid boolean strings (don't add to cleaned_params)
+            elif key in ['filter_completed'] and isinstance(value, bool):
+                # Already a boolean, use as-is
+                cleaned_params[key] = value
             else:
                 cleaned_params[key] = value
     return cleaned_params

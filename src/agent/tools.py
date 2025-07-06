@@ -1,6 +1,6 @@
 """Tools for todo management with memory integration and improved system prompts."""
 
-from typing import List, Optional, Dict, Any, Union
+from typing import List, Optional, Dict, Any
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 import json
@@ -13,7 +13,7 @@ from langchain.chat_models import init_chat_model
 from pydantic import BaseModel, Field
 from mem0 import Memory
 from qdrant_client import QdrantClient
-from qdrant_client.models import PointStruct
+from qdrant_client.models import PointStruct, Filter, FieldCondition, MatchValue
 import requests
 
 # Set up logger for this module
@@ -451,8 +451,8 @@ class ListTodosInput(BaseModel):
     """Input for listing and searching todo items."""
 
     user_id: str = Field(description="Unique identifier for the user")
-    filter_completed: Optional[bool] = Field(
-        default=None, description="Filter by completion status (true=completed, false=pending, null=all)"
+    filter_completed: Optional[str] = Field(
+        default=None, description="Filter by completion status ('true'=completed, 'false'=pending, null/empty=all)"
     )
     filter_priority: Optional[str] = Field(
         default=None, description="Filter by priority level: 'high', 'medium', 'low'"
@@ -508,6 +508,8 @@ class ListTodosTool(BaseTool):
     def __init__(self, memory: Memory, **kwargs):
         super().__init__(**kwargs)
         self._memory = memory
+        # Add direct Qdrant client for searching direct-stored todos
+        self._qdrant_client = QdrantClient(host="localhost", port=6333)
 
     @property
     def memory(self) -> Memory:
@@ -519,33 +521,86 @@ class ListTodosTool(BaseTool):
     def _run(
         self,
         user_id: str,
-        filter_completed: Optional[bool] = None,
+        filter_completed: Optional[str] = None,
         filter_priority: Optional[str] = None,
         search_query: Optional[str] = None,
     ) -> str:
         """List and filter todo items for a user with enhanced search."""
         try:
-            # Search memory for todo-related content
-            if search_query:
-                query = f"todo items tasks {search_query}"
-            else:
-                query = "todo items tasks created completed"
+            # Simple parsing - convert string to boolean if needed, otherwise ignore filter
+            completed_filter: Optional[bool] = None
+            if filter_completed and filter_completed.lower().strip() not in ['null', 'none', '']:
+                filter_completed_lower = filter_completed.lower().strip()
+                if filter_completed_lower in ['true', '1', 'yes', 'on']:
+                    completed_filter = True
+                elif filter_completed_lower in ['false', '0', 'no', 'off']:
+                    completed_filter = False
+                # Invalid values are ignored - default to plain search
             
-            # Log the memory search operation
-            logger.info(f"MEMORY SEARCH - User: {user_id}, Query: '{query}', Limit: 100")
+            # Plain vector search approach - search direct-stored todos in Qdrant first
+            memories = []
             
-            memories_result = self.memory.search(
-                query=query, user_id=user_id, limit=100
-            )
-            
-            # Log the response
-            logger.info(f"MEMORY SEARCH RESPONSE: {memories_result}")
+            logger.info(f"Direct Qdrant search for user {user_id}")
+            try:
+                scroll_result = self._qdrant_client.scroll(
+                    collection_name="todo_memories",
+                    scroll_filter=Filter(
+                        must=[
+                            FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+                            FieldCondition(key="type", match=MatchValue(value="todo_item_direct"))
+                        ]
+                    ),
+                    limit=100,
+                    with_payload=True,
+                    with_vectors=False
+                )
+                
+                # Convert Qdrant results to memory format
+                if scroll_result and len(scroll_result) > 0:
+                    points, next_page_offset = scroll_result
+                    for point in points:
+                        if point and hasattr(point, 'payload') and point.payload:
+                            payload = point.payload
+                            memories.append({
+                                "metadata": payload,
+                                "memory": f"Todo: {payload.get('title', '') if payload else ''}",
+                                "created_at": payload.get("created_at", "") if payload else ""
+                            })
+                    logger.info(f"Found {len(points)} direct todos in Qdrant")
+                
+            except Exception as qdrant_error:
+                logger.error(f"Failed to search direct todos in Qdrant: {qdrant_error}")
 
-            # Extract actual results from the response dictionary
-            if isinstance(memories_result, dict) and "results" in memories_result:
-                memories = memories_result["results"]
-            else:
-                memories = memories_result if memories_result else []
+            # Fallback to Mem0 search only if no direct todos found
+            if not memories:
+                logger.info(f"No direct todos found, trying Mem0 search for user {user_id}")
+                try:
+                    if search_query:
+                        query = f"todo items tasks {search_query}"
+                    else:
+                        query = "todo items tasks created completed"
+                    
+                    memories_result = self.memory.search(
+                        query=query, user_id=user_id, limit=100
+                    )
+                    
+                    # Extract actual results from the response dictionary
+                    if isinstance(memories_result, dict) and "results" in memories_result:
+                        mem0_memories = memories_result["results"]
+                    else:
+                        mem0_memories = memories_result if memories_result else []
+                    
+                    # Ensure mem0_memories is a list
+                    if isinstance(mem0_memories, list):
+                        memories.extend(mem0_memories)
+                        logger.info(f"Found {len(mem0_memories)} Mem0 memories")
+                        
+                except Exception as mem0_error:
+                    logger.warning(f"Mem0 search failed (expected for direct-stored todos): {mem0_error}")
+
+            # Ensure memories is a list
+            if not isinstance(memories, list):
+                memories = []
 
             if not memories:
                 return json.dumps({
@@ -569,8 +624,8 @@ class ListTodosTool(BaseTool):
                 if not isinstance(metadata, dict):
                     continue
                 
-                # Handle individual todo items
-                if metadata.get("type") == "todo_item":
+                # Handle individual todo items - support both old and new storage formats
+                if metadata.get("type") in ["todo_item", "todo_item_direct"]:
                     todo_id = metadata.get("todo_id")
                     title = metadata.get("title", "")
                     
@@ -630,12 +685,38 @@ class ListTodosTool(BaseTool):
 
             # Apply filters
             filtered_todos = []
-            for todo in unique_todos:
-                if filter_completed is not None and todo["completed"] != filter_completed:
-                    continue
-                if search_query and search_query.lower() not in todo["title"].lower():
-                    continue
-                filtered_todos.append(todo)
+            try:
+                for todo in unique_todos:
+                    # Safe boolean comparison with error handling
+                    if completed_filter is not None:
+                        todo_completed = todo.get("completed", False)
+                        if not isinstance(todo_completed, bool):
+                            # Try to convert to boolean if it's not already
+                            if isinstance(todo_completed, str):
+                                todo_completed = todo_completed.lower() in ['true', '1', 'yes', 'on']
+                            else:
+                                todo_completed = bool(todo_completed)
+                        
+                        if todo_completed != completed_filter:
+                            continue
+                    
+                    if filter_priority and todo.get("priority", "medium").lower() != filter_priority.lower():
+                        continue
+                    
+                    if search_query and search_query.lower() not in todo["title"].lower():
+                        continue
+                    
+                    filtered_todos.append(todo)
+                    
+            except Exception as filter_error:
+                logger.error(f"Error during todo filtering: {filter_error}")
+                return json.dumps({
+                    "status": "error",
+                    "action": "filtering_failed", 
+                    "user_id": user_id,
+                    "error": f"Boolean parsing issue in filtering: {str(filter_error)}",
+                    "suggestion": "Try your search without completion filters"
+                }, indent=2)
 
             if not filtered_todos:
                 return json.dumps({
@@ -644,7 +725,7 @@ class ListTodosTool(BaseTool):
                     "user_id": user_id,
                     "search_query": search_query,
                     "filters": {
-                        "completed": filter_completed,
+                        "completed": completed_filter,
                         "priority": filter_priority
                     }
                 })
@@ -661,7 +742,7 @@ class ListTodosTool(BaseTool):
                 "pending_count": len(pending_todos),
                 "completed_count": len(completed_todos),
                 "filters": {
-                    "completed": filter_completed,
+                    "completed": completed_filter,
                     "priority": filter_priority
                 },
                 "todos": {
@@ -673,12 +754,17 @@ class ListTodosTool(BaseTool):
             return json.dumps(result_data, indent=2)
 
         except Exception as e:
+            logger.error(f"Error in ListTodosTool._run: {str(e)}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
             return json.dumps({
                 "status": "error", 
                 "action": "todo_retrieval_failed",
                 "user_id": user_id,
                 "search_query": search_query,
-                "error": str(e)
+                "error": str(e),
+                "error_type": type(e).__name__,
+                "debug_info": "Error occurred in ListTodosTool._run method"
             }, indent=2)
 
 
