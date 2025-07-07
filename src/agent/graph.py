@@ -53,7 +53,7 @@ def create_todo_graph() -> StateGraph:
             agent_config = AgentConfig.from_env()
 
         memory_manager = MemoryManager(agent_config)
-        tools = create_todo_tools(memory_manager.memory)
+        tools = create_todo_tools(memory_manager.memory, agent_config)
 
         # Use ToolNode to execute the tools
         tool_executor = ToolNode(tools)

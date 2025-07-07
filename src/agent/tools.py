@@ -24,6 +24,7 @@ from src.agent.models import (
     ListTodosInput,
     CompleteTodoInput,
 )
+from src.agent.config import AgentConfig
 import requests
 
 logger = logging.getLogger(__name__)
@@ -32,22 +33,39 @@ logger = logging.getLogger(__name__)
 class UnifiedTodoStorage:
     """Unified storage handler for all todo operations using Qdrant only."""
 
-    def __init__(self):
-        self._qdrant_client = QdrantClient(host="localhost", port=6333)
-        self._embedding_url = "http://localhost:11434/api/embeddings"
-        self._collection_name = "todo_memories"  # Use existing collection
+    def __init__(self, config: AgentConfig):
+        self._config = config
+        
+        # Initialize Qdrant client with config values
+        if config.qdrant.url:
+            # Use cloud/remote URL if available
+            self._qdrant_client = QdrantClient(
+                url=config.qdrant.url,
+                api_key=config.qdrant.api_key
+            )
+        else:
+            # Use local host/port
+            self._qdrant_client = QdrantClient(
+                host=config.qdrant.host,
+                port=config.qdrant.port
+            )
+        self._embedding_url = f"{config.ollama.base_url}/api/embeddings"
+        self._collection_name = config.qdrant.collection_name
+        self._embedding_model = "bge-m3:latest"  # From embedder config
+        self._vector_size = config.qdrant.vector_size
 
     def _get_embedding(self, text: str) -> List[float]:
         """Get embedding for text using Ollama."""
         try:
             response = requests.post(
-                self._embedding_url, json={"model": "bge-m3:latest", "prompt": text}
+                self._embedding_url, 
+                json={"model": self._embedding_model, "prompt": text}
             )
             response.raise_for_status()
             return response.json()["embedding"]
         except Exception as e:
             logger.warning(f"Failed to get embedding: {type(e).__name__}")
-            return [0.0] * 1024
+            return [0.0] * self._vector_size
 
     def store_todo(self, todo: TodoItem, user_id: str) -> bool:
         """Store a todo item in Qdrant using legacy-compatible structure."""
@@ -166,7 +184,7 @@ class UnifiedTodoStorage:
                     # Use vector search for text queries
                     embedding = self._get_embedding(search_query)
                     if (
-                        embedding != [0.0] * 1024
+                        embedding != [0.0] * self._vector_size
                     ):  # Only search if we have valid embedding
                         search_result = self._qdrant_client.search(
                             collection_name=self._collection_name,
@@ -191,7 +209,6 @@ class UnifiedTodoStorage:
                 )
                 return []
 
-            # Convert to TodoItem objects
             todos = []
             for point in points:
                 if point and hasattr(point, "payload") and point.payload:
@@ -234,12 +251,17 @@ class TodoManagerTool(BaseTool):
     """
     args_schema: type = CreateTodosInput
 
-    def __init__(self, memory: Memory, **kwargs):
+    def __init__(self, memory: Memory, config: AgentConfig, **kwargs):
         super().__init__(**kwargs)
         self._memory = memory
-        self._storage = UnifiedTodoStorage()
+        self._config = config
+        self._storage = UnifiedTodoStorage(config)
         self._llm = init_chat_model(
-            model="llama3.1:8b-instruct-q8_0", model_provider="ollama"
+            model=config.ollama.model, 
+            model_provider="ollama",
+            base_url=config.ollama.base_url,
+            temperature=config.ollama.temperature,
+            max_tokens=config.ollama.max_tokens
         )
 
     def _extract_todos_structured(self, user_input: str) -> List[Dict[str, Any]]:
@@ -483,10 +505,11 @@ class ListTodosTool(BaseTool):
     """
     args_schema: type = ListTodosInput
 
-    def __init__(self, memory: Memory, **kwargs):
+    def __init__(self, memory: Memory, config: AgentConfig, **kwargs):
         super().__init__(**kwargs)
         self._memory = memory
-        self._storage = UnifiedTodoStorage()
+        self._config = config
+        self._storage = UnifiedTodoStorage(config)
 
     @property
     def memory(self) -> Memory:
@@ -580,10 +603,11 @@ class CompleteTodoTool(BaseTool):
     description: str = "Mark a todo item as completed with atomic updates."
     args_schema: type = CompleteTodoInput
 
-    def __init__(self, memory: Memory, **kwargs):
+    def __init__(self, memory: Memory, config: AgentConfig, **kwargs):
         super().__init__(**kwargs)
         self._memory = memory
-        self._storage = UnifiedTodoStorage()
+        self._config = config
+        self._storage = UnifiedTodoStorage(config)
 
     def _run(self, todo_id: str, user_id: str) -> str:
         """Mark a todo as complete using unified storage."""
@@ -628,10 +652,10 @@ class CompleteTodoTool(BaseTool):
             )
 
 
-def create_todo_tools(memory: Memory) -> List[BaseTool]:
+def create_todo_tools(memory: Memory, config: AgentConfig) -> List[BaseTool]:
     """Create all todo management tools."""
     return [
-        TodoManagerTool(memory=memory),
-        ListTodosTool(memory=memory),
-        CompleteTodoTool(memory=memory),
+        TodoManagerTool(memory=memory, config=config),
+        ListTodosTool(memory=memory, config=config),
+        CompleteTodoTool(memory=memory, config=config),
     ]

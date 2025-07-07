@@ -79,7 +79,7 @@ async def chatbot_node(state: TodoAgentState, config: RunnableConfig) -> Dict[st
     memory_manager = MemoryManager(agent_config)
 
     # Create tools with memory
-    tools = create_todo_tools(memory_manager.memory)
+    tools = create_todo_tools(memory_manager.memory, agent_config)
 
     # Initialize chat model with tools using Ollama configuration
     llm = init_chat_model(
