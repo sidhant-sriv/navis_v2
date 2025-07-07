@@ -1,420 +1,438 @@
-"""Tools for todo management with memory integration and improved system prompts."""
+"""Tools for todo management with unified storage and simplified architecture."""
 
 from typing import List, Optional, Dict, Any
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime
 import json
 import re
 import logging
 import uuid
-import time
 from langchain_core.tools import BaseTool
 from langchain.chat_models import init_chat_model
-from pydantic import BaseModel, Field
 from mem0 import Memory
 from qdrant_client import QdrantClient
-from qdrant_client.models import PointStruct, Filter, FieldCondition, MatchValue
+from qdrant_client.models import (
+    PointStruct,
+    Filter,
+    FieldCondition,
+    MatchValue,
+    UpdateStatus,
+    Condition,
+)
+from src.agent.models import (
+    TodoItem,
+    CreateTodosInput,
+    ListTodosInput,
+    CompleteTodoInput,
+)
 import requests
 
-# Set up logger for this module
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class TodoItem:
-    """A single todo item with structured data."""
+class UnifiedTodoStorage:
+    """Unified storage handler for all todo operations using Qdrant only."""
 
-    id: str
-    title: str
-    description: str
-    priority: str = "medium"  # low, medium, high
-    due_date: Optional[str] = None
-    completed: bool = False
-    created_at: str = ""
-    tags: List[str] = field(default_factory=list)
+    def __init__(self):
+        self._qdrant_client = QdrantClient(host="localhost", port=6333)
+        self._embedding_url = "http://localhost:11434/api/embeddings"
+        self._collection_name = "todo_memories"  # Use existing collection
 
-    def __post_init__(self):
-        if not self.created_at:
-            self.created_at = datetime.now().isoformat()
+    def _get_embedding(self, text: str) -> List[float]:
+        """Get embedding for text using Ollama."""
+        try:
+            response = requests.post(
+                self._embedding_url, json={"model": "bge-m3:latest", "prompt": text}
+            )
+            response.raise_for_status()
+            return response.json()["embedding"]
+        except Exception as e:
+            logger.warning(f"Failed to get embedding: {type(e).__name__}")
+            return [0.0] * 1024
 
+    def store_todo(self, todo: TodoItem, user_id: str) -> bool:
+        """Store a todo item in Qdrant using legacy-compatible structure."""
+        try:
+            content = f"Todo: {todo.title} - {todo.description} - Priority: {todo.priority} - Tags: {','.join(todo.tags)}"
+            embedding = self._get_embedding(content)
 
-class CreateTodosInput(BaseModel):
-    """Input for creating multiple todo items."""
+            # Generate UUID for point ID (Qdrant requirement)
+            point_uuid = str(uuid.uuid4())
 
-    user_input: str = Field(
-        description="The user's natural language request to create todo items. Can contain multiple tasks."
-    )
-    user_id: str = Field(description="Unique identifier for the user making the request")
+            # Use legacy-compatible payload structure
+            payload = {
+                "type": "todo_item_direct",  # Match existing type
+                "user_id": user_id,
+                "todo_id": todo.id,  # Use separate field for todo ID
+                "title": todo.title,
+                "description": todo.description,
+                "priority": todo.priority,
+                "due_date": todo.due_date,
+                "completed": todo.completed,
+                "completed_at": todo.completed_at,
+                "created_at": todo.created_at,
+                "tags": todo.tags,
+                "content": content,  # For searchability
+            }
+
+            point = PointStruct(
+                id=point_uuid,  # Use UUID for point ID
+                vector=embedding,
+                payload=payload,
+            )
+
+            try:
+                result = self._qdrant_client.upsert(
+                    collection_name=self._collection_name, points=[point]
+                )
+                return result.status == UpdateStatus.COMPLETED
+            except Exception as upsert_error:
+                logger.warning(f"Qdrant upsert failed: {type(upsert_error).__name__}")
+                return False
+
+        except Exception as e:
+            logger.error(f"Failed to store todo: {type(e).__name__}")
+            return False
+
+    def complete_todo(self, todo_id: str, user_id: str) -> bool:
+        """Mark a todo as completed by updating its payload."""
+        try:
+            search_result = self._qdrant_client.scroll(
+                collection_name=self._collection_name,
+                scroll_filter=Filter(
+                    must=[
+                        FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+                        FieldCondition(key="todo_id", match=MatchValue(value=todo_id)),
+                        FieldCondition(key="type", match=MatchValue(value="todo_item_direct")),
+                    ]
+                ),
+                limit=1,
+                with_payload=True,
+            )
+
+            points, _ = search_result
+            if not points:
+                logger.warning("Todo not found for completion request")
+                return False
+
+            # Update the payload to mark as completed
+            completion_time = datetime.now().isoformat()
+
+            # Use the actual Qdrant point ID, not the todo_id
+            point_id = points[0].id
+            self._qdrant_client.set_payload(
+                collection_name=self._collection_name,
+                points=[point_id],
+                payload={"completed": True, "completed_at": completion_time},
+            )
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to complete todo: {type(e).__name__}")
+            return False
+
+    def get_todos(
+        self,
+        user_id: str,
+        completed: Optional[bool] = None,
+        priority: Optional[str] = None,
+        search_query: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[TodoItem]:
+        """Retrieve todos with optional filtering."""
+        try:
+            # Build filter conditions - use existing field names from legacy storage
+            filter_conditions: List[Condition] = [
+                FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+                FieldCondition(
+                    key="type", match=MatchValue(value="todo_item_direct")
+                ),  # Use existing type
+            ]
+
+            if completed is not None:
+                filter_conditions.append(
+                    FieldCondition(key="completed", match=MatchValue(value=completed))
+                )
+
+            if priority:
+                filter_conditions.append(
+                    FieldCondition(key="priority", match=MatchValue(value=priority))
+                )
+
+            # Perform the search with error handling
+            points = []
+            try:
+                if search_query:
+                    # Use vector search for text queries
+                    embedding = self._get_embedding(search_query)
+                    if (
+                        embedding != [0.0] * 1024
+                    ):  # Only search if we have valid embedding
+                        search_result = self._qdrant_client.search(
+                            collection_name=self._collection_name,
+                            query_vector=embedding,
+                            query_filter=Filter(must=filter_conditions),
+                            limit=limit,
+                            with_payload=True,
+                        )
+                        points = search_result
+                else:
+                    # Use scroll for filtering without text search
+                    scroll_result = self._qdrant_client.scroll(
+                        collection_name=self._collection_name,
+                        scroll_filter=Filter(must=filter_conditions),
+                        limit=limit,
+                        with_payload=True,
+                    )
+                    points, _ = scroll_result
+            except Exception as query_error:
+                logger.warning(
+                    f"Qdrant query failed, returning empty results: {type(query_error).__name__}"
+                )
+                return []
+
+            # Convert to TodoItem objects
+            todos = []
+            for point in points:
+                if point and hasattr(point, "payload") and point.payload:
+                    payload = point.payload
+                    todo = TodoItem(
+                        id=payload.get("todo_id", payload.get("id", "")),
+                        title=payload.get("title", ""),
+                        description=payload.get(
+                            "description", payload.get("title", "")
+                        ),
+                        priority=payload.get("priority", "medium"),
+                        due_date=payload.get("due_date"),
+                        completed=payload.get("completed", False),
+                        completed_at=payload.get("completed_at"),
+                        created_at=payload.get("created_at", ""),
+                        tags=payload.get("tags", []),
+                    )
+                    todos.append(todo)
+
+            return todos
+
+        except Exception as e:
+            logger.error(f"Failed to retrieve todos: {type(e).__name__}")
+            return []
 
 
 class TodoManagerTool(BaseTool):
-    """Advanced todo creation and management tool with intelligent parsing using multiple LLM queries."""
+    """Simplified todo creation tool with single LLM call and unified storage."""
 
     name: str = "todo_manager"
-    description: str = """Create and manage multiple todo items from natural language input with intelligent parsing.
+    description: str = """Create todo items from natural language with reliable single-pass extraction.
 
-    This tool excels at:
-    - Extracting multiple tasks from complex requests  
-    - Auto-detecting priorities and due dates
-    - Categorizing todos with relevant tags
-    - Storing in memory for future access
+    Efficiently handles:
+    - Multiple tasks from one request
+    - Priority and due date detection
+    - Tag categorization
+    - Unified storage in Qdrant
     
-    Use this tool when users want to:
-    - Create new todo items ("Add X to my list")
-    - Set reminders ("Remind me to X")  
-    - Schedule tasks ("I need to do X by Y")
-    - Organize multiple items ("Create todos for: 1. X 2. Y")
+    Use for: "Add X", "Remind me to Y", "I need to do Z by tomorrow"
     """
     args_schema: type = CreateTodosInput
 
     def __init__(self, memory: Memory, **kwargs):
         super().__init__(**kwargs)
         self._memory = memory
-        # Initialize LLM for multi-step extraction
-        self._llm = init_chat_model(model="llama3.1:8b-instruct-q8_0", model_provider="ollama")
-        
-        # Initialize direct Qdrant client for bypassing Mem0
-        self._qdrant_client = QdrantClient(host="localhost", port=6333)
-        
-        # Initialize embedding model for manual embeddings
-        self._embedding_url = "http://localhost:11434/api/embeddings"
+        self._storage = UnifiedTodoStorage()
+        self._llm = init_chat_model(
+            model="llama3.1:8b-instruct-q8_0", model_provider="ollama"
+        )
 
-    @property
-    def memory(self) -> Memory:
-        """Access the memory instance."""
-        if not hasattr(self, '_memory') or self._memory is None:
-            raise RuntimeError("Memory not properly initialized in TodoManagerTool")
-        return self._memory
+    def _extract_todos_structured(self, user_input: str) -> List[Dict[str, Any]]:
+        """Extract todos using single structured LLM call."""
+        prompt = f"""Extract todo items from: "{user_input}"
 
-    def _clean_llm_response(self, response_text: str) -> List[str]:
-        """Clean LLM response by removing headers, meta-text, and explanations."""
-        lines = response_text.strip().split('\n')
-        cleaned_lines = []
-        
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-                
-            # Skip common LLM headers and meta-text
-            skip_patterns = [
-                r'^here\s+are?\s+',
-                r'^here\s+is\s+',
-                r'^the\s+following\s+',
-                r'^extracted?\s+',
-                r'^tasks?:?\s*$',
-                r'^priorities?:?\s*$',
-                r'^due\s+dates?:?\s*$',
-                r'^tags?:?\s*$',
-                r'^timeframes?:?\s*$',
-                r'^\d+\.\s*$',  # Just numbers like "1."
-                r'^output:?\s*$',
-                r'^result:?\s*$',
-                r'^answer:?\s*$',
-                r'actionable\s+tasks?',
-                r'extracted?\s+tasks?',
-                r'individual\s+tasks?',
-                r'task\s+extract',
-                r'extract.*task',
-            ]
-            
-            # Check if line matches any skip pattern
-            should_skip = any(re.match(pattern, line.lower()) for pattern in skip_patterns)
-            
-            if not should_skip and len(line) > 1:
-                cleaned_lines.append(line)
-        
-        return cleaned_lines
-
-    def _extract_tasks_llm(self, text: str) -> List[str]:
-        """Extract individual tasks using LLM."""
-        prompt = f"""Extract actionable tasks from: "{text}"
-
-Return ONLY the task text, one per line. NO headers or explanations.
+Return valid JSON array of objects. Each object must have:
+- title: string (required, max 100 chars)
+- priority: "high", "medium", or "low" 
+- due_date: string or null (tomorrow, today, Friday, etc.)
+- tags: array of strings from [work, personal, home, shopping, health, finance, social, travel, learning, maintenance]
 
 Examples:
-Input: "buy groceries and call mom" 
-Output:
-buy groceries
-call mom"""
+Input: "buy groceries and call mom tomorrow"
+Output: [
+  {{"title": "buy groceries", "priority": "medium", "due_date": "tomorrow", "tags": ["shopping"]}},
+  {{"title": "call mom", "priority": "medium", "due_date": "tomorrow", "tags": ["personal"]}}
+]
 
-        response = self._llm.invoke([{"role": "user", "content": prompt}])
-        response_text = response.content if hasattr(response, 'content') else str(response)
-        if not isinstance(response_text, str):
-            response_text = str(response_text)
-        
-        # Clean the response
-        tasks = self._clean_llm_response(response_text)
-        
-        # Fallback: simple split if LLM didn't work properly
-        if not tasks:
-            text_clean = re.sub(r'(?:i need to|remind me to|add|create)\s+', '', text, flags=re.IGNORECASE).strip()
-            parts = re.split(r',\s*(?:and\s+)?|\s+and\s+|\d+\.\s*', text_clean)
-            for part in parts:
-                clean_part = part.strip().strip('.,')
-                if clean_part and len(clean_part) > 2:
-                    tasks.append(clean_part)
-            if not tasks:
-                tasks = [text.strip()]
-        
-        return tasks
+Input: "urgent: fix the bug"
+Output: [
+  {{"title": "fix the bug", "priority": "high", "due_date": null, "tags": ["work"]}}
+]
 
-    def _extract_priorities_llm(self, tasks: List[str]) -> List[str]:
-        """Extract priority for each task using LLM."""
-        tasks_text = '\n'.join(f"{i+1}. {task}" for i, task in enumerate(tasks))
-        
-        prompt = f"""For each task, return ONLY: high, medium, or low
+Input: "{user_input}"
+Output:"""
 
-Tasks:
-{tasks_text}
-
-Rules:
-- HIGH: urgent, ASAP, critical, emergency
-- LOW: later, eventually, when possible
-- MEDIUM: default
-
-Return one word per line:"""
-
-        response = self._llm.invoke([{"role": "user", "content": prompt}])
-        response_text = response.content if hasattr(response, 'content') else str(response)
-        if not isinstance(response_text, str):
-            response_text = str(response_text)
-        
-        # Clean and parse priorities
-        lines = self._clean_llm_response(response_text)
-        priorities = []
-        for line in lines:
-            priority = line.strip().lower()
-            if priority in ['high', 'medium', 'low']:
-                priorities.append(priority)
-        
-        # Fill missing with medium
-        while len(priorities) < len(tasks):
-            priorities.append('medium')
-            
-        return priorities[:len(tasks)]
-
-    def _extract_due_dates_llm(self, tasks: List[str]) -> List[Optional[str]]:
-        """Extract due dates for each task using LLM."""
-        tasks_text = '\n'.join(f"{i+1}. {task}" for i, task in enumerate(tasks))
-        
-        prompt = f"""For each task, return timeframe or "none"
-
-Tasks:
-{tasks_text}
-
-Look for: tomorrow, today, Friday, next week, ASAP
-
-Return one per line:"""
-
-        response = self._llm.invoke([{"role": "user", "content": prompt}])
-        response_text = response.content if hasattr(response, 'content') else str(response)
-        if not isinstance(response_text, str):
-            response_text = str(response_text)
-        
-        # Clean and parse due dates
-        lines = self._clean_llm_response(response_text)
-        due_dates = []
-        for line in lines:
-            due_date = line.strip()
-            if due_date.lower() == 'none':
-                due_dates.append(None)
-            else:
-                # Additional filtering for due dates
-                if not re.match(r'^(here|the|extracted|timeframes?)', due_date.lower()):
-                    due_dates.append(due_date)
-                else:
-                    due_dates.append(None)
-        
-        # Fill missing with None
-        while len(due_dates) < len(tasks):
-            due_dates.append(None)
-            
-        return due_dates[:len(tasks)]
-
-    def _extract_tags_llm(self, tasks: List[str]) -> List[List[str]]:
-        """Extract relevant tags for each task using LLM."""
-        tasks_text = '\n'.join(f"{i+1}. {task}" for i, task in enumerate(tasks))
-        
-        prompt = f"""For each task, return tags or "none"
-
-Tasks:
-{tasks_text}
-
-Tags: work, personal, home, shopping, health, finance, social, travel, learning, maintenance
-
-Return tags separated by commas, one line per task:"""
-
-        response = self._llm.invoke([{"role": "user", "content": prompt}])
-        response_text = response.content if hasattr(response, 'content') else str(response)
-        if not isinstance(response_text, str):
-            response_text = str(response_text)
-        
-        # Clean and parse tags
-        lines = self._clean_llm_response(response_text)
-        all_tags = []
-        valid_tags = {'work', 'personal', 'home', 'shopping', 'health', 'finance', 'social', 'travel', 'learning', 'maintenance'}
-        
-        for line in lines:
-            line = line.strip()
-            if line.lower() == 'none':
-                all_tags.append([])
-            else:
-                tags = []
-                for tag in line.split(','):
-                    tag = tag.strip().lower()
-                    if tag in valid_tags:
-                        tags.append(tag)
-                all_tags.append(tags)
-        
-        # Fill missing with empty lists
-        while len(all_tags) < len(tasks):
-            all_tags.append([])
-            
-        return all_tags[:len(tasks)]
-
-    def _get_embedding(self, text: str) -> List[float]:
-        """Get embedding for text using Ollama."""
         try:
-            response = requests.post(self._embedding_url, json={
-                "model": "bge-m3:latest",
-                "prompt": text
-            })
-            response.raise_for_status()
-            return response.json()["embedding"]
-        except Exception as e:
-            logger.error(f"Failed to get embedding: {e}")
-            # Return zero vector as fallback
-            return [0.0] * 1024
-    
-    def _store_todo_direct(self, todo: Dict[str, Any], user_id: str) -> Dict[str, Any]:
-        """Store todo directly in Qdrant bypassing Mem0 fact extraction."""
-        try:
-            # Create embedding from todo content
-            content = f"Todo: {todo['title']} - {todo['description']} - Priority: {todo['priority']} - Tags: {','.join(todo['tags'])}"
-            embedding = self._get_embedding(content)
-            
-            # Prepare point for Qdrant
-            point_id = todo["uuid"]  # Use proper UUID as the point ID
-            
-            payload = {
-                "type": "todo_item_direct",
-                "user_id": user_id,
-                "todo_id": todo["id"],
-                "title": todo["title"],
-                "description": todo["description"],
-                "priority": todo["priority"],
-                "due_date": todo["due_date"],
-                "completed": todo["completed"],
-                "tags": todo["tags"],
-                "created_at": todo["created_at"],
-                "content": content  # For searchability
-            }
-            
-            # Store directly in Qdrant
-            self._qdrant_client.upsert(
-                collection_name="todo_memories",
-                points=[
-                    PointStruct(
-                        id=point_id,
-                        vector=embedding,
-                        payload=payload
-                    )
-                ]
+            response = self._llm.invoke([{"role": "user", "content": prompt}])
+            response_text = str(
+                response.content if hasattr(response, "content") else response
             )
-            
-            logger.info(f"Stored todo {todo['id']} directly in Qdrant")
-            return {"success": True, "id": point_id}
-            
-        except Exception as e:
-            logger.error(f"Failed to store todo {todo['id']} directly: {e}")
-            return {"success": False, "error": str(e)}
+
+            # Extract JSON from response
+            json_match = re.search(r"\[.*\]", response_text, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(0)
+                todos = json.loads(json_str)
+
+                # Validate and clean each todo
+                cleaned_todos = []
+                for todo in todos:
+                    if isinstance(todo, dict) and todo.get("title"):
+                        cleaned_todo = {
+                            "title": str(todo["title"])[:100].strip(),
+                            "priority": todo.get("priority", "medium").lower(),
+                            "due_date": todo.get("due_date"),
+                            "tags": todo.get("tags", []),
+                        }
+
+                        # Validate priority
+                        if cleaned_todo["priority"] not in ["high", "medium", "low"]:
+                            cleaned_todo["priority"] = "medium"
+
+                        # Validate tags
+                        valid_tags = {
+                            "work",
+                            "personal",
+                            "home",
+                            "shopping",
+                            "health",
+                            "finance",
+                            "social",
+                            "travel",
+                            "learning",
+                            "maintenance",
+                        }
+                        cleaned_todo["tags"] = [
+                            tag for tag in cleaned_todo["tags"] if tag in valid_tags
+                        ]
+
+                        cleaned_todos.append(cleaned_todo)
+
+                return cleaned_todos
+
+        except (json.JSONDecodeError, Exception) as e:
+            logger.warning(
+                f"Failed to parse structured LLM response: {type(e).__name__}"
+            )
+
+        # Fallback to simple parsing
+        return self._fallback_parse(user_input)
+
+    def _fallback_parse(self, user_input: str) -> List[Dict[str, Any]]:
+        """Simple fallback parsing when structured extraction fails."""
+        # Simple split on common separators
+        text = re.sub(
+            r"(?:i need to|remind me to|add|create)\s+",
+            "",
+            user_input,
+            flags=re.IGNORECASE,
+        ).strip()
+        parts = re.split(r",\s*(?:and\s+)?|\s+and\s+|\d+\.\s*", text)
+
+        todos = []
+        for part in parts:
+            title = part.strip().strip(".,")
+            if title and len(title) > 2:
+                # Simple priority detection
+                priority = (
+                    "high"
+                    if any(
+                        word in title.lower() for word in ["urgent", "asap", "critical"]
+                    )
+                    else "medium"
+                )
+
+                # Simple due date detection
+                due_date = None
+                if any(
+                    word in title.lower() for word in ["tomorrow", "today", "tonight"]
+                ):
+                    due_date = "tomorrow" if "tomorrow" in title.lower() else "today"
+
+                todos.append(
+                    {
+                        "title": title[:100],
+                        "priority": priority,
+                        "due_date": due_date,
+                        "tags": [],
+                    }
+                )
+
+        # If no todos extracted, create one from the entire input
+        if not todos:
+            todos = [
+                {
+                    "title": user_input.strip()[:100],
+                    "priority": "medium",
+                    "due_date": None,
+                    "tags": [],
+                }
+            ]
+
+        return todos
 
     def _run(self, user_input: str, user_id: str) -> str:
-        """Execute the tool to create todo items with enhanced multi-LLM extraction."""
+        """Execute the tool to create todo items with simplified single-call extraction."""
         try:
-            logger.info(f"Processing todo creation for user {user_id}: {user_input}")
-            
-            # Step 1: Extract individual tasks
-            tasks = self._extract_tasks_llm(user_input)
-            if not tasks:
-                return json.dumps({
-                    "status": "no_todos_extracted",
-                    "message": "No actionable todo items found in your request",
-                    "user_input": user_input,
-                })
+            # Single structured extraction call
+            todo_data = self._extract_todos_structured(user_input)
+            if not todo_data:
+                return json.dumps(
+                    {
+                        "status": "no_todos_extracted",
+                        "message": "No actionable todo items found in your request",
+                        "user_input": user_input,
+                    }
+                )
 
-            # Step 2: Extract priorities, due dates, and tags in parallel
-            priorities = self._extract_priorities_llm(tasks)
-            due_dates = self._extract_due_dates_llm(tasks)
-            tags_list = self._extract_tags_llm(tasks)
+            # Create TodoItem objects and store them
+            created_todos = []
+            failed_todos = []
 
-            # Step 3: Create structured todos
-            extracted_todos = []
-            for i, task in enumerate(tasks):
-                todo_uuid = uuid.uuid4()
-                todo_id = f"todo_{todo_uuid.hex[:8]}"  # Keep this for display
-                
-                extracted_todos.append({
-                    "id": todo_id,
-                    "uuid": str(todo_uuid),  # Proper UUID for Qdrant point ID
-                    "title": task.strip()[:100],
-                    "description": task.strip(),
-                    "priority": priorities[i] if i < len(priorities) else "medium",
-                    "due_date": due_dates[i] if i < len(due_dates) else None,
-                    "completed": False,
-                    "created_at": datetime.now().isoformat(),
-                    "tags": tags_list[i] if i < len(tags_list) else [],
-                })
+            for data in todo_data:
+                todo_id = f"todo_{uuid.uuid4().hex[:8]}"
+                todo = TodoItem(
+                    id=todo_id,
+                    title=data["title"],
+                    description=data[
+                        "title"
+                    ],  # Use title as description for simplicity
+                    priority=data["priority"],
+                    due_date=data["due_date"],
+                    tags=data["tags"],
+                )
 
-            logger.info(f"Extracted {len(extracted_todos)} todos: {[t['title'] for t in extracted_todos]}")
+                # Store in unified storage
+                if self._storage.store_todo(todo, user_id):
+                    created_todos.append(todo.to_dict())
+                else:
+                    failed_todos.append(data["title"])
 
-            # Store each todo as a separate memory entry
-            memory_results = []
-            
-            for i, todo in enumerate(extracted_todos):
-                logger.info(f"[{i+1}/{len(extracted_todos)}] Storing todo '{todo['title']}' with ID {todo['id']}")
-                
-                # Store directly in Qdrant bypassing Mem0
-                direct_result = self._store_todo_direct(todo, user_id)
-                memory_results.append(direct_result)
-                
-                time.sleep(0.1)  # Small delay
+            if not created_todos:
+                return json.dumps(
+                    {
+                        "status": "storage_failed",
+                        "message": "Failed to store any todo items",
+                        "user_input": user_input,
+                        "failed_todos": failed_todos,
+                    }
+                )
 
-            # Compute summary statistics first
+            # Compute summary statistics
             priority_counts = {"high": 0, "medium": 0, "low": 0}
             due_date_count = 0
             all_tags = set()
-            
-            for todo in extracted_todos:
+
+            for todo in created_todos:
                 priority_counts[todo["priority"]] += 1
                 if todo["due_date"]:
                     due_date_count += 1
                 all_tags.update(todo["tags"])
-
-            # Store summary with delay to ensure individual todos are processed first
-            time.sleep(0.1)  # Small delay to let individual todos be processed
-            
-            summary_messages = [
-                {"role": "user", "content": f"BATCH_SUMMARY: Created {len(extracted_todos)} todos from: {user_input}"},
-                {"role": "assistant", "content": f"BATCH_COMPLETE: Successfully created batch of {len(extracted_todos)} todos with IDs: {', '.join([t['id'] for t in extracted_todos])}"}
-            ]
-            summary_metadata = {
-                "type": "todo_batch_creation",
-                "todo_count": len(extracted_todos),
-                "todo_ids": [todo["id"] for todo in extracted_todos],
-                "priority_distribution": priority_counts,
-                "has_due_dates": due_date_count,
-                "unique_tags": list(all_tags),
-                "created_at": datetime.now().isoformat(),
-                "batch_id": f"batch_{user_id}_{datetime.now().timestamp()}"  # Unique batch ID
-            }
-            
-            summary_result = self.memory.add(
-                messages=summary_messages,
-                user_id=user_id,
-                metadata=summary_metadata,
-            )
 
             # Return structured data
             result_data = {
@@ -422,99 +440,58 @@ Return tags separated by commas, one line per task:"""
                 "action": "todos_created",
                 "user_id": user_id,
                 "user_input": user_input,
-                "created_count": len(extracted_todos),
-                "memory_stored": True,
-                "todos": extracted_todos,
+                "created_count": len(created_todos),
+                "failed_count": len(failed_todos),
+                "todos": created_todos,
+                "failed_todos": failed_todos,
                 "summary": {
-                    "total": len(extracted_todos),
+                    "total": len(created_todos),
                     "priorities": priority_counts,
                     "with_due_dates": due_date_count,
-                    "tags": list(all_tags)
-                }
+                    "tags": list(all_tags),
+                },
             }
-            
+
             return json.dumps(result_data, indent=2)
 
         except Exception as e:
-            logger.error(f"Error in todo creation: {str(e)}")
-            return json.dumps({
-                "status": "error",
-                "action": "todo_creation_failed",
-                "user_input": user_input,
-                "user_id": user_id,
-                "error": str(e),
-                "suggestion": "Please try again with a simpler request."
-            }, indent=2)
-
-
-class ListTodosInput(BaseModel):
-    """Input for listing and searching todo items."""
-
-    user_id: str = Field(description="Unique identifier for the user")
-    filter_completed: Optional[str] = Field(
-        default=None, description="Filter by completion status ('true'=completed, 'false'=pending, null/empty=all)"
-    )
-    filter_priority: Optional[str] = Field(
-        default=None, description="Filter by priority level: 'high', 'medium', 'low'"
-    )
-    search_query: Optional[str] = Field(
-        default=None, description="Search for specific keywords in todo titles/descriptions"
-    )
+            logger.error(f"Error in todo creation: {type(e).__name__}")
+            return json.dumps(
+                {
+                    "status": "error",
+                    "action": "todo_creation_failed",
+                    "user_id": user_id,
+                    "error": "Internal processing error",
+                    "suggestion": "Please try again with a simpler request.",
+                },
+                indent=2,
+            )
 
 
 class ListTodosTool(BaseTool):
-    """Advanced todo listing and search tool with intelligent memory retrieval.
-    
-    SYSTEM PROMPT: You are an expert todo retrieval assistant. Your job is to:
-    
-    1. SEARCH memory efficiently for user's todo items
-    2. PARSE and ORGANIZE todo data from memory storage  
-    3. FILTER todos based on user criteria (priority, completion, keywords)
-    4. PRESENT todos in a clear, actionable format
-    
-    SEARCH CAPABILITIES:
-    - Retrieve all todos for a user
-    - Filter by completion status (done vs pending)
-    - Filter by priority level (high, medium, low)
-    - Search by keywords in titles/descriptions
-    - Sort by creation date, due date, priority
-    
-    OUTPUT FORMAT:
-    - Clear categorization by status and priority
-    - Include all relevant todo metadata (ID, due dates, tags)
-    - Show statistics (total count, completed percentage)
-    - Provide actionable next steps
-    
-    ALWAYS provide context about what todos exist and suggest relevant actions.
-    """
+    """Simplified todo listing tool with unified storage and database-level filtering."""
 
     name: str = "list_todos"
-    description: str = """List, search, and filter todo items from user's memory with advanced options.
+    description: str = """List and filter todo items with efficient database queries.
 
-    This tool excels at:
-    - Retrieving all stored todos for a user
-    - Filtering by priority, completion status, or keywords
-    - Providing organized views of todo lists
-    - Showing relevant metadata and context
+    Efficiently handles:
+    - Retrieving todos with database-level filtering
+    - Completion status, priority, and text search
+    - Organized results with statistics
     
-    Use this tool when users want to:
-    - See their current todos ("Show my todos")
-    - Find specific items ("Find todos about work") 
-    - Check completed items ("What did I finish today?")
-    - Review by priority ("Show my urgent tasks")
+    Use for: "Show my todos", "Find work tasks", "What's completed?"
     """
     args_schema: type = ListTodosInput
 
     def __init__(self, memory: Memory, **kwargs):
         super().__init__(**kwargs)
         self._memory = memory
-        # Add direct Qdrant client for searching direct-stored todos
-        self._qdrant_client = QdrantClient(host="localhost", port=6333)
+        self._storage = UnifiedTodoStorage()
 
     @property
     def memory(self) -> Memory:
         """Access the memory instance."""
-        if not hasattr(self, '_memory') or self._memory is None:
+        if not hasattr(self, "_memory") or self._memory is None:
             raise RuntimeError("Memory not properly initialized in ListTodosTool")
         return self._memory
 
@@ -525,326 +502,130 @@ class ListTodosTool(BaseTool):
         filter_priority: Optional[str] = None,
         search_query: Optional[str] = None,
     ) -> str:
-        """List and filter todo items for a user with enhanced search."""
+        """List and filter todo items using unified storage."""
         try:
-            # Simple parsing - convert string to boolean if needed, otherwise ignore filter
+            # Parse completion filter with proper validation
             completed_filter: Optional[bool] = None
-            if filter_completed and filter_completed.lower().strip() not in ['null', 'none', '']:
+            if filter_completed and filter_completed.lower().strip() not in [
+                "null",
+                "none",
+                "",
+            ]:
                 filter_completed_lower = filter_completed.lower().strip()
-                if filter_completed_lower in ['true', '1', 'yes', 'on']:
+                if filter_completed_lower in ["true", "1", "yes", "on"]:
                     completed_filter = True
-                elif filter_completed_lower in ['false', '0', 'no', 'off']:
+                elif filter_completed_lower in ["false", "0", "no", "off"]:
                     completed_filter = False
-                # Invalid values are ignored - default to plain search
-            
-            # Plain vector search approach - search direct-stored todos in Qdrant first
-            memories = []
-            
-            logger.info(f"Direct Qdrant search for user {user_id}")
-            try:
-                scroll_result = self._qdrant_client.scroll(
-                    collection_name="todo_memories",
-                    scroll_filter=Filter(
-                        must=[
-                            FieldCondition(key="user_id", match=MatchValue(value=user_id)),
-                            FieldCondition(key="type", match=MatchValue(value="todo_item_direct"))
-                        ]
-                    ),
-                    limit=100,
-                    with_payload=True,
-                    with_vectors=False
-                )
-                
-                # Convert Qdrant results to memory format
-                if scroll_result and len(scroll_result) > 0:
-                    points, next_page_offset = scroll_result
-                    for point in points:
-                        if point and hasattr(point, 'payload') and point.payload:
-                            payload = point.payload
-                            memories.append({
-                                "metadata": payload,
-                                "memory": f"Todo: {payload.get('title', '') if payload else ''}",
-                                "created_at": payload.get("created_at", "") if payload else ""
-                            })
-                    logger.info(f"Found {len(points)} direct todos in Qdrant")
-                
-            except Exception as qdrant_error:
-                logger.error(f"Failed to search direct todos in Qdrant: {qdrant_error}")
 
-            # Fallback to Mem0 search only if no direct todos found
-            if not memories:
-                logger.info(f"No direct todos found, trying Mem0 search for user {user_id}")
-                try:
-                    if search_query:
-                        query = f"todo items tasks {search_query}"
-                    else:
-                        query = "todo items tasks created completed"
-                    
-                    memories_result = self.memory.search(
-                        query=query, user_id=user_id, limit=100
-                    )
-                    
-                    # Extract actual results from the response dictionary
-                    if isinstance(memories_result, dict) and "results" in memories_result:
-                        mem0_memories = memories_result["results"]
-                    else:
-                        mem0_memories = memories_result if memories_result else []
-                    
-                    # Ensure mem0_memories is a list
-                    if isinstance(mem0_memories, list):
-                        memories.extend(mem0_memories)
-                        logger.info(f"Found {len(mem0_memories)} Mem0 memories")
-                        
-                except Exception as mem0_error:
-                    logger.warning(f"Mem0 search failed (expected for direct-stored todos): {mem0_error}")
+            # Use unified storage to retrieve todos with database-level filtering
+            todos = self._storage.get_todos(
+                user_id=user_id,
+                completed=completed_filter,
+                priority=filter_priority,
+                search_query=search_query,
+                limit=100,
+            )
 
-            # Ensure memories is a list
-            if not isinstance(memories, list):
-                memories = []
-
-            if not memories:
-                return json.dumps({
-                    "status": "no_memories_found",
-                    "message": f"No todos found for user {user_id}",
-                    "user_id": user_id,
-                    "suggestion": "Try creating some todos first!"
-                })
-
-            # Extract todos from memory
-            all_todos = []
-            completed_todo_ids = set()
-            
-            for memory_item in memories:
-                if not isinstance(memory_item, dict):
-                    continue
-                    
-                metadata = memory_item.get("metadata", {})
-                memory_content = memory_item.get("memory", "")
-                
-                if not isinstance(metadata, dict):
-                    continue
-                
-                # Handle individual todo items - support both old and new storage formats
-                if metadata.get("type") in ["todo_item", "todo_item_direct"]:
-                    todo_id = metadata.get("todo_id")
-                    title = metadata.get("title", "")
-                    
-                    if todo_id and title and title.strip():
-                        all_todos.append({
-                            "id": todo_id,
-                            "title": title.strip(),
-                            "description": metadata.get("description", ""),
-                            "priority": metadata.get("priority", "medium"),
-                            "due_date": metadata.get("due_date"),
-                            "completed": metadata.get("completed", False),
-                            "tags": metadata.get("tags", []),
-                            "created_at": metadata.get("created_at", "")
-                        })
-                
-                # Handle completion records
-                elif metadata.get("type") == "todo_completion":
-                    completed_id = metadata.get("todo_id")
-                    if completed_id:
-                        completed_todo_ids.add(completed_id)
-                
-                # Fallback: extract from memory content if no structured data
-                elif not all_todos and "todo" in memory_content.lower():
-                    # Simple extraction from content
-                    import re
-                    patterns = [
-                        r"Created.*?todos?:\s*([^.\n!]+)",
-                        r"added?\s+[\"']?([^\"'\n.!]+)[\"']?\s+to",
-                        r"todo:?\s*([^.\n!]+)"
-                    ]
-                    
-                    for pattern in patterns:
-                        matches = re.findall(pattern, memory_content, re.IGNORECASE)
-                        for match in matches:
-                            title = match.strip()
-                            if title and len(title) > 2:
-                                all_todos.append({
-                                    "id": f"content_{len(all_todos)+1:04d}",
-                                    "title": title,
-                                    "completed": False,
-                                    "created_at": memory_item.get("created_at", "")
-                                })
-
-            # Remove duplicates based on title
-            seen_titles = set()
-            unique_todos = []
-            for todo in all_todos:
-                title_key = todo["title"].lower().strip()
-                if title_key not in seen_titles:
-                    seen_titles.add(title_key)
-                    unique_todos.append(todo)
-
-            # Mark completed todos
-            for todo in unique_todos:
-                if todo["id"] in completed_todo_ids:
-                    todo["completed"] = True
-
-            # Apply filters
-            filtered_todos = []
-            try:
-                for todo in unique_todos:
-                    # Safe boolean comparison with error handling
-                    if completed_filter is not None:
-                        todo_completed = todo.get("completed", False)
-                        if not isinstance(todo_completed, bool):
-                            # Try to convert to boolean if it's not already
-                            if isinstance(todo_completed, str):
-                                todo_completed = todo_completed.lower() in ['true', '1', 'yes', 'on']
-                            else:
-                                todo_completed = bool(todo_completed)
-                        
-                        if todo_completed != completed_filter:
-                            continue
-                    
-                    if filter_priority and todo.get("priority", "medium").lower() != filter_priority.lower():
-                        continue
-                    
-                    if search_query and search_query.lower() not in todo["title"].lower():
-                        continue
-                    
-                    filtered_todos.append(todo)
-                    
-            except Exception as filter_error:
-                logger.error(f"Error during todo filtering: {filter_error}")
-                return json.dumps({
-                    "status": "error",
-                    "action": "filtering_failed", 
-                    "user_id": user_id,
-                    "error": f"Boolean parsing issue in filtering: {str(filter_error)}",
-                    "suggestion": "Try your search without completion filters"
-                }, indent=2)
-
-            if not filtered_todos:
-                return json.dumps({
-                    "status": "no_todos_found",
-                    "message": f"No todos found matching your criteria for user {user_id}",
-                    "user_id": user_id,
-                    "search_query": search_query,
-                    "filters": {
-                        "completed": completed_filter,
-                        "priority": filter_priority
+            if not todos:
+                return json.dumps(
+                    {
+                        "status": "no_todos_found",
+                        "message": f"No todos found for user {user_id}",
+                        "user_id": user_id,
+                        "search_query": search_query,
+                        "filters": {
+                            "completed": completed_filter,
+                            "priority": filter_priority,
+                        },
+                        "suggestion": "Try creating some todos first!",
                     }
-                })
+                )
 
-            # Return structured data instead of formatted string
-            pending_todos = [t for t in filtered_todos if not t["completed"]]
-            completed_todos = [t for t in filtered_todos if t["completed"]]
-            
+            # Convert TodoItem objects to dictionaries and categorize
+            todo_dicts = [todo.to_dict() for todo in todos]
+            pending_todos = [t for t in todo_dicts if not t["completed"]]
+            completed_todos = [t for t in todo_dicts if t["completed"]]
+
             result_data = {
                 "status": "success",
                 "user_id": user_id,
                 "search_query": search_query,
-                "total_todos": len(filtered_todos),
+                "total_todos": len(todo_dicts),
                 "pending_count": len(pending_todos),
                 "completed_count": len(completed_todos),
-                "filters": {
-                    "completed": completed_filter,
-                    "priority": filter_priority
-                },
-                "todos": {
-                    "pending": pending_todos,
-                    "completed": completed_todos
-                }
+                "filters": {"completed": completed_filter, "priority": filter_priority},
+                "todos": {"pending": pending_todos, "completed": completed_todos},
             }
-            
+
             return json.dumps(result_data, indent=2)
 
         except Exception as e:
-            logger.error(f"Error in ListTodosTool._run: {str(e)}")
-            import traceback
-            logger.error(f"Full traceback: {traceback.format_exc()}")
-            return json.dumps({
-                "status": "error", 
-                "action": "todo_retrieval_failed",
-                "user_id": user_id,
-                "search_query": search_query,
-                "error": str(e),
-                "error_type": type(e).__name__,
-                "debug_info": "Error occurred in ListTodosTool._run method"
-            }, indent=2)
-
-
-class CompleteTodoInput(BaseModel):
-    """Input for completing a todo item."""
-
-    todo_id: str = Field(description="Todo item ID to mark as complete")
-    user_id: str = Field(description="User identifier")
+            logger.error(f"Error in todo retrieval: {type(e).__name__}")
+            return json.dumps(
+                {
+                    "status": "error",
+                    "action": "todo_retrieval_failed",
+                    "user_id": user_id,
+                    "error": "Internal retrieval error",
+                    "error_type": type(e).__name__,
+                },
+                indent=2,
+            )
 
 
 class CompleteTodoTool(BaseTool):
-    """Tool for marking todo items as complete."""
+    """Tool for marking todo items as complete using unified storage."""
 
     name: str = "complete_todo"
-    description: str = "Mark a todo item as completed and update memory."
+    description: str = "Mark a todo item as completed with atomic updates."
     args_schema: type = CompleteTodoInput
 
     def __init__(self, memory: Memory, **kwargs):
         super().__init__(**kwargs)
         self._memory = memory
-
-    @property
-    def memory(self) -> Memory:
-        """Access the memory instance."""
-        if not hasattr(self, '_memory') or self._memory is None:
-            raise RuntimeError("Memory not properly initialized in CompleteTodoTool")
-        return self._memory
+        self._storage = UnifiedTodoStorage()
 
     def _run(self, todo_id: str, user_id: str) -> str:
-        """Mark a todo as complete."""
+        """Mark a todo as complete using unified storage."""
         try:
-            # Add completion to memory
-            completion_message = f"Completed todo item: {todo_id}"
-            
-            # Prepare memory add operation
-            messages = [
-                {
-                    "role": "user",
-                    "content": f"I completed the task with ID {todo_id}",
-                }
-            ]
-            metadata = {
-                "type": "todo_completion",
-                "todo_id": todo_id,
-                "completed_at": datetime.now().isoformat(),
-            }
+            # Use unified storage to complete the todo atomically
+            success = self._storage.complete_todo(todo_id, user_id)
 
-            # Log the memory add operation
-            logger.info(f"MEMORY ADD - User: {user_id}, Messages: {messages}, Metadata: {metadata}")
-
-            memory_result = self.memory.add(
-                messages=messages,
-                user_id=user_id,
-                metadata=metadata,
-            )
-            
-            # Log the response
-            logger.info(f"MEMORY ADD RESPONSE: {memory_result}")
+            if not success:
+                return json.dumps(
+                    {
+                        "status": "not_found",
+                        "action": "todo_completion_failed",
+                        "todo_id": todo_id,
+                        "user_id": user_id,
+                        "error": "Todo not found or does not belong to user",
+                    },
+                    indent=2,
+                )
 
             # Return structured data
             result_data = {
                 "status": "success",
-                "action": "todo_completed", 
+                "action": "todo_completed",
                 "todo_id": todo_id,
                 "user_id": user_id,
-                "completed_at": metadata["completed_at"],
-                "memory_stored": True
+                "completed_at": datetime.now().isoformat(),
             }
-            
+
             return json.dumps(result_data, indent=2)
 
         except Exception as e:
-            error_data = {
-                "status": "error",
-                "action": "todo_completion_failed",
-                "todo_id": todo_id,
-                "user_id": user_id,
-                "error": str(e)
-            }
-            return json.dumps(error_data, indent=2)
+            logger.error(f"Error in todo completion: {type(e).__name__}")
+            return json.dumps(
+                {
+                    "status": "error",
+                    "action": "todo_completion_failed",
+                    "todo_id": todo_id,
+                    "user_id": user_id,
+                    "error": "Internal completion error",
+                },
+                indent=2,
+            )
 
 
 def create_todo_tools(memory: Memory) -> List[BaseTool]:
@@ -854,5 +635,3 @@ def create_todo_tools(memory: Memory) -> List[BaseTool]:
         ListTodosTool(memory=memory),
         CompleteTodoTool(memory=memory),
     ]
-
-

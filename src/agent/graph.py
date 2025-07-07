@@ -38,32 +38,32 @@ def create_todo_graph() -> StateGraph:
     # We'll bind tools in the chatbot node, but we need to create them here for the ToolNode
     # The actual tools will be created with memory in the chatbot node
     # For now, create a placeholder - the real tools are created in chatbot_node
-    
+
     # Add the main chatbot node
     graph.add_node("chatbot", chatbot_node)
-    
+
     # Add tools node - we'll use a simple approach and create tools with default config
     # The tools will be re-created in each node call but that's acceptable for this use case
     def tools_node(state: TodoAgentState, config: RunnableConfig):
         """Tools node that creates tools with proper memory configuration."""
         configuration = config.get("configurable", {})
         agent_config = configuration.get("agent_config")
-        
+
         if not agent_config:
             agent_config = AgentConfig.from_env()
-            
+
         memory_manager = MemoryManager(agent_config)
         tools = create_todo_tools(memory_manager.memory)
-        
+
         # Use ToolNode to execute the tools
         tool_executor = ToolNode(tools)
         return tool_executor.invoke(state, config)
-    
+
     graph.add_node("tools", tools_node)
 
     # Set up the flow: START -> chatbot
     graph.add_edge(START, "chatbot")
-    
+
     # Add conditional edges from chatbot
     graph.add_conditional_edges(
         "chatbot",
@@ -73,7 +73,7 @@ def create_todo_graph() -> StateGraph:
             "__end__": END,
         },
     )
-    
+
     # After tools, go back to chatbot for final response, but should_continue will determine if we end
     graph.add_edge("tools", "chatbot")
 
@@ -113,7 +113,7 @@ async def run_todo_agent(
     # Prepare configuration
     config: RunnableConfig = {
         "configurable": {"agent_config": agent_config, "user_id": user_id},
-        "recursion_limit": 10
+        "recursion_limit": 10,
     }
 
     try:
@@ -122,8 +122,8 @@ async def run_todo_agent(
         return result
     except Exception as e:
         return {
-            "messages": [HumanMessage(content=f"Error running todo agent: {str(e)}")], 
-            "error": str(e)
+            "messages": [HumanMessage(content=f"Error running todo agent: {str(e)}")],
+            "error": str(e),
         }
 
 
@@ -150,14 +150,14 @@ async def example_usage():
         print(f"Input: {test_input}")
 
         result = await run_todo_agent(test_input, user_id, config)
-        
+
         # Extract response from messages
         response_text = "No response"
         if result.get("messages"):
             latest_msg = result["messages"][-1]
-            if hasattr(latest_msg, 'content'):
+            if hasattr(latest_msg, "content"):
                 response_text = latest_msg.content
-        
+
         print(f"Response: {response_text}")
 
         if result.get("error"):
