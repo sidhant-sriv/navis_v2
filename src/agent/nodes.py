@@ -14,7 +14,7 @@ import re
 
 from src.agent.config import AgentConfig
 from src.agent.state import TodoAgentState
-from src.agent.tools import create_todo_tools
+from src.agent.tools import create_todo_tools, create_conversation_tools, UserInfoExtractor, UserInfoStorage
 
 
 class MemoryManager:
@@ -61,11 +61,11 @@ def clean_tool_params(params: Dict[str, Any]) -> Dict[str, Any]:
     return cleaned_params
 
 
-async def chatbot_node(state: TodoAgentState, config: RunnableConfig) -> Dict[str, Any]:
-    """Main chatbot node that processes user messages with LLM and tools.
+async def todo_chatbot_node(state: TodoAgentState, config: RunnableConfig) -> Dict[str, Any]:
+    """Todo-focused chatbot node that processes todo operations with LLM and tools.
 
-    This follows the standard LangGraph pattern of using an LLM with bound tools
-    to process user messages and decide what actions to take.
+    This node is only called when intent routing determines the user wants todo operations.
+    It follows the standard LangGraph pattern of using an LLM with bound tools.
     """
     configuration = config.get("configurable", {})
     agent_config = configuration.get("agent_config")
@@ -77,6 +77,17 @@ async def chatbot_node(state: TodoAgentState, config: RunnableConfig) -> Dict[st
 
     # Initialize components
     memory_manager = MemoryManager(agent_config)
+    
+    # Retrieve user context for enhanced todo creation
+    user_context_summary = ""
+    try:
+        user_info_storage = UserInfoStorage(agent_config)
+        user_context = user_info_storage.get_user_context(user_id)
+        user_context_summary = user_context.get_context_summary()
+        if user_context_summary != "No user context available":
+            print(f"DEBUG: Retrieved user context: {user_context_summary}")
+    except Exception as e:
+        print(f"DEBUG: Failed to retrieve user context: {e}")
 
     # Create tools with memory
     tools = create_todo_tools(memory_manager.memory, agent_config)
@@ -116,7 +127,7 @@ async def chatbot_node(state: TodoAgentState, config: RunnableConfig) -> Dict[st
         )
 
         # Add system message for final response
-        final_system_prompt = f"""You are a todo management assistant. Based on the tool results in the conversation, provide a clear, helpful summary response to the user.
+        final_system_prompt = f"""You are Navis, a todo management assistant. Based on the tool results in the conversation, provide a clear, helpful summary response to the user.
 
 USER ID: {user_id}
 
@@ -129,6 +140,7 @@ DO NOT make any more tool calls. Just summarize what was accomplished based on t
             return {
                 "messages": [final_response],
                 "user_id": user_id,
+                "user_context": user_context_summary if user_context_summary else None,
                 "processing_complete": True,
                 "todo_results": {"last_action": "final_summary"},
             }
@@ -137,19 +149,28 @@ DO NOT make any more tool calls. Just summarize what was accomplished based on t
             return {
                 "messages": [AIMessage(content=error_msg)],
                 "user_id": user_id,
+                "user_context": user_context_summary if user_context_summary else None,
                 "processing_complete": True,
                 "todo_results": {"error": error_msg},
             }
 
     # Add system message if this is the first interaction
     if not any(msg.type == "system" for msg in messages):
-        system_prompt = f"""You are a todo management assistant. You MUST use tools for ALL todo operations.
+        # Include user context in the system prompt if available
+        context_section = ""
+        if user_context_summary and user_context_summary != "No user context available":
+            context_section = f"""
 
-USER ID: {user_id}
+USER CONTEXT (use this to create more relevant todos):
+{user_context_summary}
 
-IMPORTANT: Tools return structured JSON data that you must format appropriately for the user.
+When creating todos, consider the user's context to make them more specific and actionable."""
 
-For todo operations, call the appropriate tool:
+        system_prompt = f"""You are Navis, a todo management assistant focused on task operations.
+
+USER ID: {user_id}{context_section}
+
+The user's request has been classified as todo-related. Use the appropriate tools:
 - To CREATE todos: call todo_manager with user_input and user_id
 - To LIST todos: call list_todos with user_id (and optional filters)
 - To COMPLETE todos: call complete_todo with todo_id and user_id
@@ -161,7 +182,7 @@ When you receive tool results:
 4. Highlight important information like counts, priorities, due dates
 5. Provide helpful context and next steps
 
-Always use proper tool calling format and format the tool results nicely for the user."""
+Format tool results nicely for the user and provide clear, helpful responses."""
 
         # Insert system message at the beginning
         messages = [SystemMessage(content=system_prompt)] + messages
@@ -229,6 +250,7 @@ Always use proper tool calling format and format the tool results nicely for the
                         return {
                             "messages": [ai_response],
                             "user_id": user_id,
+                            "user_context": user_context_summary if user_context_summary else None,
                             "processing_complete": False,
                             "todo_results": (
                                 {"aggressive_parsed": tool_name}
@@ -256,6 +278,7 @@ Always use proper tool calling format and format the tool results nicely for the
                 return {
                     "messages": [ai_response],
                     "user_id": user_id,
+                    "user_context": user_context_summary if user_context_summary else None,
                     "processing_complete": False,
                     "todo_results": (
                         {"forced_tool": "list_todos"}
@@ -285,6 +308,7 @@ Always use proper tool calling format and format the tool results nicely for the
                     return {
                         "messages": [ai_response],
                         "user_id": user_id,
+                        "user_context": user_context_summary if user_context_summary else None,
                         "processing_complete": False,
                         "todo_results": (
                             {"forced_tool": "todo_manager"}
@@ -449,6 +473,7 @@ Always use proper tool calling format and format the tool results nicely for the
                 return {
                     "messages": [ai_response],
                     "user_id": user_id,
+                    "user_context": user_context_summary if user_context_summary else None,
                     "processing_complete": False,
                     "todo_results": (
                         {"parsed_tool": tool_name} if not is_new_human_message else None
@@ -466,6 +491,7 @@ Always use proper tool calling format and format the tool results nicely for the
         return {
             "messages": [response],
             "user_id": user_id,
+            "user_context": user_context_summary if user_context_summary else None,
             "processing_complete": not has_tool_calls,
             "todo_results": (
                 {"last_action": "chatbot_processing"}
@@ -479,6 +505,7 @@ Always use proper tool calling format and format the tool results nicely for the
         return {
             "messages": [AIMessage(content=error_msg)],
             "user_id": user_id,
+            "user_context": user_context_summary if user_context_summary else None,
             "processing_complete": True,
             "todo_results": {"error": error_msg},
         }
@@ -527,3 +554,263 @@ def should_continue(state: TodoAgentState) -> str:
 
     # Otherwise, we're done
     return "__end__"
+
+
+def get_latest_human_message(messages: list) -> str:
+    """Extract the latest human message from the message list."""
+    for message in reversed(messages):
+        if hasattr(message, 'type') and message.type == "human":
+            return message.content
+    return ""
+
+
+def fallback_pattern_match(user_input: str) -> str:
+    """Simple pattern matching fallback for intent classification."""
+    text = user_input.lower()
+    
+    # Strong todo indicators
+    todo_patterns = [
+        "add", "create", "make", "remind", "schedule",
+        "list", "show", "display", "what are my",
+        "complete", "done", "finish", "mark",
+        "todo", "task", "reminder", "need to", "have to"
+    ]
+    
+    # Strong conversation indicators  
+    conversation_patterns = [
+        "hello", "hi", "hey", "how are you",
+        "what can you", "help", "explain",
+        "tell me", "weather", "how do"
+    ]
+    
+    if any(pattern in text for pattern in todo_patterns):
+        return "todo"
+    elif any(pattern in text for pattern in conversation_patterns):
+        return "conversation"
+    else:
+        # Default to conversation for ambiguous cases
+        return "conversation"
+
+
+async def intent_router_node(state: TodoAgentState, config: RunnableConfig) -> Dict[str, Any]:
+    """Simple binary router: todo vs conversation."""
+    
+    messages = state.get("messages", [])
+    user_message = get_latest_human_message(messages)
+    
+    if not user_message:
+        # No user message found, default to conversation
+        return {
+            "detected_intent": "conversation",
+            "processing_complete": False
+        }
+    
+    # Simple classification prompt - just binary choice
+    classification_prompt = f"""
+    Determine if this user input requires todo operations or is general conversation.
+    
+    Input: "{user_message}"
+    
+    Todo operations include:
+    - Creating tasks ("add", "create", "remind me to")
+    - Listing tasks ("show", "list", "what are my")  
+    - Completing tasks ("mark done", "complete", "finished")
+    - Task-related questions ("how many tasks", "what's my next")
+    
+    General conversation includes:
+    - Greetings ("hello", "hi", "how are you")
+    - Questions about the system ("what can you do", "help")
+    - General questions ("weather", "explain", "tell me about")
+    
+    Reply with only: "todo" or "conversation"
+    """
+    
+    # Get LLM classification
+    configuration = config.get("configurable", {})
+    agent_config = configuration.get("agent_config") or AgentConfig.from_env()
+    
+    llm = init_chat_model(
+        model=agent_config.ollama.model,
+        model_provider="ollama",
+        base_url=agent_config.ollama.base_url,
+        temperature=0.0  # Deterministic responses
+    )
+    
+    try:
+        response = llm.invoke([{"role": "user", "content": classification_prompt}])
+        content = response.content if hasattr(response, 'content') else str(response)
+        intent = str(content).strip().lower()
+        
+        # Fallback pattern matching if LLM gives unexpected response
+        if intent not in ["todo", "conversation"]:
+            intent = fallback_pattern_match(user_message)
+            
+        print(f"DEBUG: Intent classification - Input: '{user_message}' -> Intent: '{intent}'")
+        
+    except Exception as e:
+        print(f"DEBUG: Intent classification failed: {e}, using fallback")
+        intent = fallback_pattern_match(user_message)
+    
+    return {
+        "detected_intent": intent,
+        "processing_complete": False
+    }
+
+
+async def conversation_chatbot_node(state: TodoAgentState, config: RunnableConfig) -> Dict[str, Any]:
+    """Handle general conversation with memory search capabilities."""
+    
+    configuration = config.get("configurable", {})
+    agent_config = configuration.get("agent_config") or AgentConfig.from_env()
+    user_id = configuration.get("user_id", state.get("user_id", "default_user"))
+    
+    # Get the latest user message for information extraction
+    messages = state.get("messages", [])
+    user_message = get_latest_human_message(messages)
+    
+    # Check if this is a fresh human message (not a tool result processing)
+    most_recent_message = messages[-1] if messages else None
+    is_fresh_human_message = (
+        most_recent_message and 
+        most_recent_message.type == "human" and 
+        not any(msg.type == "tool" for msg in messages[-3:])  # No recent tool messages
+    )
+    
+    # Only extract user information on fresh human messages to avoid duplicates
+    if (is_fresh_human_message and 
+        user_message and 
+        len(user_message.strip()) > 10 and 
+        not state.get("user_info_extracted", False)):  # Track if we already extracted
+        
+        try:
+            user_info_extractor = UserInfoExtractor(agent_config)
+            extracted_infos = user_info_extractor.extract_and_store_user_info(user_message, user_id)
+            if extracted_infos:
+                print(f"DEBUG: Extracted {len(extracted_infos)} pieces of user information")
+                # Mark that we've extracted info for this conversation turn
+                state["user_info_extracted"] = True
+        except Exception as e:
+            print(f"DEBUG: Failed to extract user info: {e}")
+    
+    # Initialize memory manager and tools
+    memory_manager = MemoryManager(agent_config)
+    conversation_tools = create_conversation_tools(memory_manager.memory, agent_config)
+    
+    # Initialize LLM with tools for memory search capabilities
+    llm = init_chat_model(
+        model=agent_config.ollama.model,
+        model_provider="ollama", 
+        base_url=agent_config.ollama.base_url,
+        temperature=0.3
+    )
+    llm_with_tools = llm.bind_tools(conversation_tools)
+    
+    # Check if we just received tool results
+    most_recent_message = messages[-1] if messages else None
+    has_immediate_tool_results = (
+        most_recent_message and most_recent_message.type == "tool"
+    )
+    
+    if has_immediate_tool_results:
+        print("DEBUG: Conversation node processing tool results")
+        # Use LLM without tools to generate final response based on tool results
+        llm = init_chat_model(
+            model=agent_config.ollama.model,
+            model_provider="ollama",
+            base_url=agent_config.ollama.base_url,
+            temperature=0.3
+        )
+        
+        final_system_prompt = f"""You are Navis, a helpful and intelligent todo management assistant. Based on the memory search results in the conversation, provide a natural, friendly, and personalized response to the user's question.
+
+USER ID: {user_id}
+
+Use the information from the memory search to answer the user's personal question with context and warmth. If the search found relevant information, present it naturally and show that you remember details about them. If no information was found, acknowledge this warmly and encourage them to share more about themselves so you can provide better assistance.
+
+Examples of good responses:
+- "Based on what you've told me, your name is Sarah Chen and you work as a Senior Data Scientist at Google..."
+- "I remember you mentioning that you work best in the mornings and enjoy rock climbing on weekends..."
+- "From our previous conversations, I know you're working on recommendation algorithms at Google..."
+
+DO NOT make any more tool calls. Just provide a conversational response based on the tool results."""
+        
+        final_messages = [SystemMessage(content=final_system_prompt)] + messages
+        
+        try:
+            response = llm.invoke(final_messages)
+            return {
+                "messages": [response],
+                "user_id": user_id,
+                "processing_complete": True,
+                "todo_results": {"interaction_type": "conversation_with_memory"}
+            }
+        except Exception as e:
+            error_msg = f"Error generating memory-based response: {str(e)}"
+            return {
+                "messages": [AIMessage(content=error_msg)],
+                "user_id": user_id,
+                "processing_complete": True,
+                "todo_results": {"error": error_msg}
+            }
+    
+    # Add system message for conversation with memory search capabilities
+    if not any(msg.type == "system" for msg in messages):
+        system_prompt = f"""You are Navis, an intelligent and personable todo management assistant. You excel at having natural conversations while helping users manage their tasks and remembering important details about their lives and work.
+
+USER ID: {user_id}
+
+CONVERSATION STYLE:
+- Be warm, friendly, and genuinely interested in the user
+- Show that you remember and care about their personal context
+- Ask thoughtful follow-up questions to learn more about their goals and preferences
+- Provide personalized suggestions based on what you know about them
+
+MEMORY AND PERSONALIZATION:
+When users ask personal questions about themselves, you MUST ALWAYS call the search_user_memories tool first. Do not answer from general knowledge.
+
+MANDATORY TOOL USAGE - Call search_user_memories when users ask:
+- "What is my name?" → call search_user_memories with query="name"
+- "What do I do for work?" → call search_user_memories with query="work job"
+- "What are my preferences?" → call search_user_memories with query="preferences"
+- "What projects am I working on?" → call search_user_memories with query="projects"
+- "Tell me about myself" → call search_user_memories with query="personal information"
+- Any question about their personal details, work, hobbies, or past conversations
+
+NEVER answer personal questions without calling the tool first. The user expects you to remember their information.
+
+TODO MANAGEMENT:
+For actual todo operations (create, list, complete tasks), guide users to make specific requests. Explain your capabilities when asked, but keep the focus on having a natural conversation and building a relationship.
+
+Be genuinely helpful, show interest in their life, and make them feel heard and understood."""
+        
+        messages = [SystemMessage(content=system_prompt)] + messages
+    
+    try:
+        response = llm_with_tools.invoke(messages)
+        
+        return {
+            "messages": [response],
+            "user_id": user_id,
+            "processing_complete": False,  # May need to handle tool calls
+            "todo_results": {"interaction_type": "conversation"}
+        }
+    except Exception as e:
+        error_msg = f"Error in conversation: {str(e)}"
+        return {
+            "messages": [AIMessage(content=error_msg)],
+            "user_id": user_id,
+            "processing_complete": True,
+            "todo_results": {"error": error_msg}
+        }
+
+
+def simple_route_decision(state: TodoAgentState) -> str:
+    """Simple routing without confidence thresholds."""
+    intent = state.get("detected_intent", "conversation")
+    
+    print(f"DEBUG: Routing decision - Intent: '{intent}' -> Route: {'todo_chatbot' if intent == 'todo' else 'conversation_chatbot'}")
+    
+    if intent == "todo":
+        return "todo_chatbot"
+    else:
+        return "conversation_chatbot"

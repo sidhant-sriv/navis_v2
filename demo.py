@@ -75,9 +75,9 @@ async def demo_todo_agent():
             response_text = "No response generated"
             if result.get("messages"):
                 latest_msg = result["messages"][-1]
-                if hasattr(latest_msg, 'content'):
+                if hasattr(latest_msg, "content"):
                     response_text = latest_msg.content
-            
+
             print(f"Response:\n{response_text}")
 
             if result.get("error"):
@@ -177,7 +177,7 @@ def interactive_mode():
             response_text = "No response generated"
             if result.get("messages"):
                 latest_msg = result["messages"][-1]
-                if hasattr(latest_msg, 'content'):
+                if hasattr(latest_msg, "content"):
                     response_text = latest_msg.content
 
             print(f"\n🤖 Assistant: {response_text}")

@@ -17,12 +17,20 @@ from qdrant_client.models import (
     MatchValue,
     UpdateStatus,
     Condition,
+    VectorParams,
+    Distance,
 )
 from src.agent.models import (
     TodoItem,
+    UserInfo,
+    UserContext,
+    UserInfoType,
+    TodoTag,
+    UserInfoTag,
     CreateTodosInput,
     ListTodosInput,
     CompleteTodoInput,
+    ExtractUserInfoInput,
 )
 from src.agent.config import AgentConfig
 import requests
@@ -30,11 +38,61 @@ import requests
 logger = logging.getLogger(__name__)
 
 
+def ensure_qdrant_collections(config: AgentConfig) -> None:
+    """Ensure both todo and user profile collections exist in Qdrant."""
+    try:
+        # Initialize Qdrant client
+        if config.qdrant.url:
+            client = QdrantClient(
+                url=config.qdrant.url,
+                api_key=config.qdrant.api_key
+            )
+        else:
+            client = QdrantClient(
+                host=config.qdrant.host,
+                port=config.qdrant.port
+            )
+        
+        # Collection configuration
+        vector_config = VectorParams(
+            size=config.qdrant.vector_size,
+            distance=Distance.COSINE
+        )
+        
+        # Ensure todo collection exists
+        try:
+            client.get_collection(config.qdrant.todo_collection_name)
+            logger.info(f"Todo collection '{config.qdrant.todo_collection_name}' already exists")
+        except Exception:
+            client.create_collection(
+                collection_name=config.qdrant.todo_collection_name,
+                vectors_config=vector_config
+            )
+            logger.info(f"Created todo collection '{config.qdrant.todo_collection_name}'")
+        
+        # Ensure user profile collection exists
+        try:
+            client.get_collection(config.qdrant.user_profile_collection_name)
+            logger.info(f"User profile collection '{config.qdrant.user_profile_collection_name}' already exists")
+        except Exception:
+            client.create_collection(
+                collection_name=config.qdrant.user_profile_collection_name,
+                vectors_config=vector_config
+            )
+            logger.info(f"Created user profile collection '{config.qdrant.user_profile_collection_name}'")
+            
+    except Exception as e:
+        logger.error(f"Failed to ensure Qdrant collections: {type(e).__name__}")
+
+
 class UnifiedTodoStorage:
     """Unified storage handler for all todo operations using Qdrant only."""
 
     def __init__(self, config: AgentConfig):
         self._config = config
+        
+        # Ensure collections exist
+        ensure_qdrant_collections(config)
         
         # Initialize Qdrant client with config values
         if config.qdrant.url:
@@ -50,7 +108,7 @@ class UnifiedTodoStorage:
                 port=config.qdrant.port
             )
         self._embedding_url = f"{config.ollama.base_url}/api/embeddings"
-        self._collection_name = config.qdrant.collection_name
+        self._collection_name = config.qdrant.todo_collection_name
         self._embedding_model = "bge-m3:latest"  # From embedder config
         self._vector_size = config.qdrant.vector_size
 
@@ -235,6 +293,206 @@ class UnifiedTodoStorage:
             return []
 
 
+class UserInfoStorage:
+    """Storage handler for user information and context using Qdrant."""
+    
+    def __init__(self, config: AgentConfig):
+        self._config = config
+        
+        # Ensure collections exist  
+        ensure_qdrant_collections(config)
+        
+        # Initialize Qdrant client with config values
+        if config.qdrant.url:
+            self._qdrant_client = QdrantClient(
+                url=config.qdrant.url,
+                api_key=config.qdrant.api_key
+            )
+        else:
+            self._qdrant_client = QdrantClient(
+                host=config.qdrant.host,
+                port=config.qdrant.port
+            )
+        self._embedding_url = f"{config.ollama.base_url}/api/embeddings"
+        self._collection_name = config.qdrant.user_profile_collection_name
+        self._embedding_model = "bge-m3:latest"
+        self._vector_size = config.qdrant.vector_size
+    
+    def _get_embedding(self, text: str) -> List[float]:
+        """Get embedding for text using Ollama."""
+        try:
+            response = requests.post(
+                self._embedding_url,
+                json={"model": self._embedding_model, "prompt": text}
+            )
+            response.raise_for_status()
+            return response.json()["embedding"]
+        except Exception as e:
+            logger.warning(f"Failed to get embedding: {type(e).__name__}")
+            return [0.0] * self._vector_size
+    
+    def store_user_info(self, user_info: UserInfo) -> bool:
+        """Store user information in Qdrant with deduplication."""
+        try:
+            # Check for existing similar content to avoid duplicates
+            existing_infos = self.search_user_info(
+                user_info.user_id, 
+                user_info.content, 
+                limit=5
+            )
+            
+            # Check if we already have very similar content
+            for existing in existing_infos:
+                # Simple similarity check - if content is very similar, skip storing
+                if (existing.content.lower().strip() == user_info.content.lower().strip() or
+                    (len(existing.content) > 10 and existing.content.lower() in user_info.content.lower()) or
+                    (len(user_info.content) > 10 and user_info.content.lower() in existing.content.lower())):
+                    
+                    logger.info(f"Skipping duplicate user info: '{user_info.content}' (similar to existing: '{existing.content}')")
+                    return True  # Return True since the info is already stored
+            
+            # Create searchable content
+            content = f"User info ({user_info.info_type}): {user_info.content}"
+            if user_info.tags:
+                content += f" - Tags: {', '.join(user_info.tags)}"
+            
+            embedding = self._get_embedding(content)
+            point_uuid = str(uuid.uuid4())
+            
+            payload = {
+                "type": "user_info",
+                "user_id": user_info.user_id,
+                "info_id": user_info.id,
+                "info_type": user_info.info_type,
+                "content": user_info.content,
+                "relevance_score": user_info.relevance_score,
+                "tags": user_info.tags,
+                "created_at": user_info.created_at,
+                "last_used": user_info.last_used,
+                "searchable_content": content,
+            }
+            
+            point = PointStruct(
+                id=point_uuid,
+                vector=embedding,
+                payload=payload,
+            )
+            
+            result = self._qdrant_client.upsert(
+                collection_name=self._collection_name, points=[point]
+            )
+            
+            if result.status == UpdateStatus.COMPLETED:
+                logger.info(f"Stored new user info: '{user_info.content}'")
+                return True
+            return False
+            
+        except Exception as e:
+            logger.error(f"Failed to store user info: {type(e).__name__}")
+            return False
+    
+    def get_user_context(self, user_id: str, limit: int = 20) -> UserContext:
+        """Retrieve user context for todo creation."""
+        try:
+            # Get all user info for this user
+            filter_conditions: List[Condition] = [
+                FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+                FieldCondition(key="type", match=MatchValue(value="user_info")),
+            ]
+            
+            scroll_result = self._qdrant_client.scroll(
+                collection_name=self._collection_name,
+                scroll_filter=Filter(must=filter_conditions),
+                limit=limit,
+                with_payload=True,
+            )
+            points, _ = scroll_result
+            
+            # Organize by info type
+            user_context = UserContext(user_id=user_id)
+            
+            for point in points:
+                if point and hasattr(point, "payload") and point.payload:
+                    payload = point.payload
+                    
+                    # Parse info_type from string to enum
+                    info_type_str = payload.get("info_type", "personal")
+                    try:
+                        info_type = UserInfoType(info_type_str)
+                    except ValueError:
+                        info_type = UserInfoType.PERSONAL
+                    
+                    user_info = UserInfo(
+                        id=payload.get("info_id", ""),
+                        user_id=payload.get("user_id", user_id),
+                        info_type=info_type,
+                        content=payload.get("content", ""),
+                        relevance_score=payload.get("relevance_score", 1.0),
+                        tags=payload.get("tags", []),
+                        created_at=payload.get("created_at", ""),
+                        last_used=payload.get("last_used"),
+                    )
+                    
+                    # Add to context using the new method
+                    user_context.add_info(user_info)
+            
+            return user_context
+            
+        except Exception as e:
+            logger.error(f"Failed to retrieve user context: {type(e).__name__}")
+            return UserContext(user_id=user_id)
+    
+    def search_user_info(self, user_id: str, query: str, limit: int = 10) -> List[UserInfo]:
+        """Search user information by text query."""
+        try:
+            embedding = self._get_embedding(query)
+            if embedding == [0.0] * self._vector_size:
+                return []
+            
+            filter_conditions: List[Condition] = [
+                FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+                FieldCondition(key="type", match=MatchValue(value="user_info")),
+            ]
+            
+            search_result = self._qdrant_client.search(
+                collection_name=self._collection_name,
+                query_vector=embedding,
+                query_filter=Filter(must=filter_conditions),
+                limit=limit,
+                with_payload=True,
+            )
+            
+            user_infos = []
+            for point in search_result:
+                if point and hasattr(point, "payload") and point.payload:
+                    payload = point.payload
+                    
+                    # Parse info_type from string to enum
+                    info_type_str = payload.get("info_type", "personal")
+                    try:
+                        info_type = UserInfoType(info_type_str)
+                    except ValueError:
+                        info_type = UserInfoType.PERSONAL
+                    
+                    user_info = UserInfo(
+                        id=payload.get("info_id", ""),
+                        user_id=payload.get("user_id", user_id),
+                        info_type=info_type,
+                        content=payload.get("content", ""),
+                        relevance_score=payload.get("relevance_score", 1.0),
+                        tags=payload.get("tags", []),
+                        created_at=payload.get("created_at", ""),
+                        last_used=payload.get("last_used"),
+                    )
+                    user_infos.append(user_info)
+            
+            return user_infos
+            
+        except Exception as e:
+            logger.error(f"Failed to search user info: {type(e).__name__}")
+            return []
+
+
 class TodoManagerTool(BaseTool):
     """Simplified todo creation tool with single LLM call and unified storage."""
 
@@ -266,13 +524,17 @@ class TodoManagerTool(BaseTool):
 
     def _extract_todos_structured(self, user_input: str) -> List[Dict[str, Any]]:
         """Extract todos using single structured LLM call."""
+        # Get available todo tags from enum
+        available_tags = TodoTag.get_all_tags()
+        tags_str = ', '.join(available_tags)
+        
         prompt = f"""Extract todo items from: "{user_input}"
 
 Return valid JSON array of objects. Each object must have:
 - title: string (required, max 100 chars)
 - priority: "high", "medium", or "low" 
 - due_date: string or null (tomorrow, today, Friday, etc.)
-- tags: array of strings from [work, personal, home, shopping, health, finance, social, travel, learning, maintenance]
+- tags: array of strings from [{tags_str}]
 
 Examples:
 Input: "buy groceries and call mom tomorrow"
@@ -316,19 +578,8 @@ Output:"""
                         if cleaned_todo["priority"] not in ["high", "medium", "low"]:
                             cleaned_todo["priority"] = "medium"
 
-                        # Validate tags
-                        valid_tags = {
-                            "work",
-                            "personal",
-                            "home",
-                            "shopping",
-                            "health",
-                            "finance",
-                            "social",
-                            "travel",
-                            "learning",
-                            "maintenance",
-                        }
+                        # Validate tags using enum
+                        valid_tags = set(TodoTag.get_all_tags())
                         cleaned_todo["tags"] = [
                             tag for tag in cleaned_todo["tags"] if tag in valid_tags
                         ]
@@ -652,10 +903,222 @@ class CompleteTodoTool(BaseTool):
             )
 
 
+class UserInfoExtractor:
+    """Extract and store user information from conversations."""
+    
+    def __init__(self, config: AgentConfig):
+        self._config = config
+        self._storage = UserInfoStorage(config)
+        self._llm = init_chat_model(
+            model=config.ollama.model,
+            model_provider="ollama",
+            base_url=config.ollama.base_url,
+            temperature=0.1,
+            max_tokens=config.ollama.max_tokens
+        )
+    
+    def extract_and_store_user_info(self, conversation_text: str, user_id: str) -> List[UserInfo]:
+        """Extract user information from conversation and store it."""
+        
+        # Get available info types and tags from enums
+        available_types = UserInfoType.get_all_types()
+        types_str = '", "'.join(available_types)
+        
+        available_tags = UserInfoTag.get_all_tags()
+        tags_str = ', '.join(available_tags)
+        
+        extraction_prompt = f"""
+        You are Navis, a todo management assistant. Analyze this conversation and extract rich, contextual personal information about the user that will help you provide better, more personalized assistance in future interactions.
+        
+        Conversation: "{conversation_text}"
+        
+        Extract detailed, context-rich information that would be helpful for:
+        - Creating more relevant and personalized todos
+        - Understanding the user's work context and responsibilities
+        - Adapting to their preferences and communication style
+        - Providing better suggestions and reminders
+        
+        Focus on extracting:
+        - Personal details (full name, job title/role, company, family members, location)
+        - Work context (current projects, responsibilities, team, schedule, deadlines)
+        - Preferences (working hours, communication style, priorities, tools they use)
+        - Interests and hobbies (activities they enjoy, skills, passions)
+        - Goals and aspirations (career goals, personal objectives, learning interests)
+        - Routine and habits (daily patterns, meeting schedules, recurring activities)
+        
+        IMPORTANT: Make each extracted piece of information rich and specific. Instead of "works at Google", extract "works as a Senior Data Scientist at Google focusing on machine learning for search algorithms".
+        
+        Return a JSON array of objects with:
+        - info_type: one of ["{types_str}"]
+        - content: detailed, context-rich description of the information
+        - relevance_score: 0.1-1.0 (how useful for creating personalized todos)
+        - tags: relevant tags from [{tags_str}]
+        
+        Only extract clear, factual information. Skip generic greetings.
+        If no useful information, return empty array [].
+        
+        Example:
+        Input: "Hi, I'm Sarah Chen and I work as a Senior Data Scientist at Google in the Search team. I'm currently working on improving recommendation algorithms and I have a big presentation next Friday. I usually work best in the mornings and I love rock climbing on weekends."
+        Output: [
+          {{"info_type": "personal", "content": "full name is Sarah Chen", "relevance_score": 1.0, "tags": ["personal"]}},
+          {{"info_type": "personal", "content": "works as Senior Data Scientist at Google Search team, focuses on recommendation algorithms", "relevance_score": 0.95, "tags": ["work"]}},
+          {{"info_type": "project", "content": "currently working on improving recommendation algorithms with upcoming presentation next Friday", "relevance_score": 0.9, "tags": ["work", "deadline"]}},
+          {{"info_type": "preference", "content": "works best and is most productive during morning hours", "relevance_score": 0.8, "tags": ["work", "schedule"]}},
+          {{"info_type": "personal", "content": "enjoys rock climbing as weekend hobby and stress relief activity", "relevance_score": 0.7, "tags": ["hobby", "schedule"]}}
+        ]
+        
+        Input: "{conversation_text}"
+        Output:
+        """
+        
+        try:
+            response = self._llm.invoke([{"role": "user", "content": extraction_prompt}])
+            response_text = str(response.content if hasattr(response, "content") else response)
+            
+            # Extract JSON array from response
+            json_match = re.search(r"\[.*\]", response_text, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(0)
+                extracted_data = json.loads(json_str)
+                
+                stored_infos = []
+                for data in extracted_data:
+                    if isinstance(data, dict) and data.get("content"):
+                        # Parse info_type from string to enum
+                        info_type_str = data.get("info_type", "personal")
+                        try:
+                            info_type = UserInfoType(info_type_str)
+                        except ValueError:
+                            # Default to personal if invalid type
+                            info_type = UserInfoType.PERSONAL
+                        
+                        # Validate and filter tags using enum
+                        raw_tags = data.get("tags", [])
+                        valid_user_tags = set(UserInfoTag.get_all_tags())
+                        validated_tags = [tag for tag in raw_tags if tag in valid_user_tags]
+                        
+                        # Create UserInfo object
+                        user_info = UserInfo(
+                            id=f"info_{uuid.uuid4().hex[:8]}",
+                            user_id=user_id,
+                            info_type=info_type,
+                            content=data["content"],
+                            relevance_score=float(data.get("relevance_score", 0.5)),
+                            tags=validated_tags
+                        )
+                        
+                        # Store the information
+                        if self._storage.store_user_info(user_info):
+                            stored_infos.append(user_info)
+                            logger.info(f"Stored user info: {user_info.content}")
+                
+                return stored_infos
+        
+        except (json.JSONDecodeError, Exception) as e:
+            logger.warning(f"Failed to extract user info: {type(e).__name__}")
+        
+        return []
+
+
+class UserMemorySearchTool(BaseTool):
+    """Tool for searching user memories and personal information."""
+
+    name: str = "search_user_memories"
+    description: str = """ALWAYS use this tool when the user asks ANY personal question about themselves.
+
+    REQUIRED for questions like:
+    - "What is my name?" or "Who am I?" → search with "name"
+    - "What do I do for work?" or "What's my job?" → search with "work job"
+    - "What are my preferences?" → search with "preferences"
+    - "Tell me about myself" → search with "personal information"
+    - "What projects am I working on?" → search with "projects"
+    - "What are my hobbies?" → search with "hobbies interests"
+    
+    NEVER answer personal questions without using this tool first. The user expects you to remember their information.
+    """
+    args_schema: type = ExtractUserInfoInput
+
+    def __init__(self, memory: Memory, config: AgentConfig, **kwargs):
+        super().__init__(**kwargs)
+        self._memory = memory
+        self._config = config
+        self._storage = UserInfoStorage(config)
+
+    def _run(self, query: str, user_id: str) -> str:
+        """Search user memories and return relevant information."""
+        try:
+            # Search for relevant user information
+            user_infos = self._storage.search_user_info(user_id, query, limit=10)
+            
+            if not user_infos:
+                return json.dumps({
+                    "status": "no_memories_found",
+                    "message": "No relevant personal information found in your memories",
+                    "query": query,
+                    "user_id": user_id,
+                    "suggestion": "You can share personal information with me and I'll remember it for future conversations."
+                })
+            
+            # Organize results by info type
+            personal_info = []
+            preferences = []
+            projects = []
+            other_info = []
+            
+            for info in user_infos:
+                info_dict = {
+                    "content": info.content,
+                    "relevance_score": info.relevance_score,
+                    "tags": info.tags,
+                    "created_at": info.created_at
+                }
+                
+                if info.info_type == UserInfoType.PERSONAL:
+                    personal_info.append(info_dict)
+                elif info.info_type == UserInfoType.PREFERENCE:
+                    preferences.append(info_dict)
+                elif info.info_type == UserInfoType.PROJECT:
+                    projects.append(info_dict)
+                else:
+                    other_info.append(info_dict)
+            
+            result_data = {
+                "status": "success",
+                "query": query,
+                "user_id": user_id,
+                "total_memories": len(user_infos),
+                "memories": {
+                    "personal": personal_info,
+                    "preferences": preferences,
+                    "projects": projects,
+                    "other": other_info
+                }
+            }
+            
+            return json.dumps(result_data, indent=2)
+            
+        except Exception as e:
+            logger.error(f"Error searching user memories: {type(e).__name__}")
+            return json.dumps({
+                "status": "error",
+                "action": "memory_search_failed",
+                "query": query,
+                "user_id": user_id,
+                "error": "Internal search error"
+            })
+
+
 def create_todo_tools(memory: Memory, config: AgentConfig) -> List[BaseTool]:
     """Create all todo management tools."""
     return [
         TodoManagerTool(memory=memory, config=config),
         ListTodosTool(memory=memory, config=config),
         CompleteTodoTool(memory=memory, config=config),
+    ]
+
+
+def create_conversation_tools(memory: Memory, config: AgentConfig) -> List[BaseTool]:
+    """Create tools for conversation chatbot including memory search."""
+    return [
+        UserMemorySearchTool(memory=memory, config=config),
     ]

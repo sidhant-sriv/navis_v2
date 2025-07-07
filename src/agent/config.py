@@ -11,10 +11,17 @@ class QdrantConfig:
 
     host: str = "localhost"
     port: int = 6333
-    collection_name: str = "todo_memories"
+    todo_collection_name: str = "todo_memories"
+    user_profile_collection_name: str = "user_profiles"
     vector_size: int = 1024  # Match mxbai-embed-large dimensions
     api_key: Optional[str] = None
     url: Optional[str] = None
+    
+    # Legacy property for backward compatibility
+    @property
+    def collection_name(self) -> str:
+        """Legacy collection name - defaults to todo collection."""
+        return self.todo_collection_name
 
 
 @dataclass
@@ -51,7 +58,8 @@ class AgentConfig:
             qdrant=QdrantConfig(
                 host=os.getenv("QDRANT_HOST", "localhost"),
                 port=int(os.getenv("QDRANT_PORT", "6333")),
-                collection_name=os.getenv("QDRANT_COLLECTION", "todo_memories"),
+                todo_collection_name=os.getenv("QDRANT_TODO_COLLECTION", "todo_memories"),
+                user_profile_collection_name=os.getenv("QDRANT_USER_PROFILE_COLLECTION", "user_profiles"),
                 api_key=os.getenv("QDRANT_API_KEY"),
                 url=os.getenv("QDRANT_URL"),
             ),
@@ -76,7 +84,7 @@ class AgentConfig:
             "vector_store": {
                 "provider": "qdrant",
                 "config": {
-                    "collection_name": self.qdrant.collection_name,
+                    "collection_name": self.qdrant.todo_collection_name,
                     "host": self.qdrant.host,
                     "port": self.qdrant.port,
                     "embedding_model_dims": self.qdrant.vector_size,
