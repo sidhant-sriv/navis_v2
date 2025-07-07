@@ -20,14 +20,21 @@ from qdrant_client.models import (
 )
 from src.agent.models import (
     TodoItem,
+    UserInfo,
+    UserInfoType,
+    TodoTag,
     CreateTodosInput,
     ListTodosInput,
     CompleteTodoInput,
+    BulkCompleteTodoInput,
+    SearchUserMemoriesInput,
 )
 from src.agent.config import AgentConfig
+from src.agent.memory_adapters import create_memory_adapter
 import requests
 
 logger = logging.getLogger(__name__)
+
 
 
 class UnifiedTodoStorage:
@@ -50,7 +57,7 @@ class UnifiedTodoStorage:
                 port=config.qdrant.port
             )
         self._embedding_url = f"{config.ollama.base_url}/api/embeddings"
-        self._collection_name = config.qdrant.collection_name
+        self._collection_name = config.qdrant.todo_collection_name
         self._embedding_model = "bge-m3:latest"  # From embedder config
         self._vector_size = config.qdrant.vector_size
 
@@ -73,14 +80,12 @@ class UnifiedTodoStorage:
             content = f"Todo: {todo.title} - {todo.description} - Priority: {todo.priority} - Tags: {','.join(todo.tags)}"
             embedding = self._get_embedding(content)
 
-            # Generate UUID for point ID (Qdrant requirement)
             point_uuid = str(uuid.uuid4())
 
-            # Use legacy-compatible payload structure
             payload = {
-                "type": "todo_item_direct",  # Match existing type
+                "type": "todo_item_direct",
                 "user_id": user_id,
-                "todo_id": todo.id,  # Use separate field for todo ID
+                "todo_id": todo.id,
                 "title": todo.title,
                 "description": todo.description,
                 "priority": todo.priority,
@@ -89,11 +94,11 @@ class UnifiedTodoStorage:
                 "completed_at": todo.completed_at,
                 "created_at": todo.created_at,
                 "tags": todo.tags,
-                "content": content,  # For searchability
+                "content": content,
             }
 
             point = PointStruct(
-                id=point_uuid,  # Use UUID for point ID
+                id=point_uuid,
                 vector=embedding,
                 payload=payload,
             )
@@ -149,6 +154,68 @@ class UnifiedTodoStorage:
             logger.error(f"Failed to complete todo: {type(e).__name__}")
             return False
 
+    def complete_todos_bulk(self, todo_ids: List[str], user_id: str) -> Dict[str, Any]:
+        """Mark multiple todos as completed in a batch operation."""
+        completion_time = datetime.now().isoformat()
+        results = {
+            "completed": [],
+            "failed": [],
+            "not_found": []
+        }
+        
+        try:
+            for todo_id in todo_ids:
+                try:
+                    # Find the todo
+                    search_result = self._qdrant_client.scroll(
+                        collection_name=self._collection_name,
+                        scroll_filter=Filter(
+                            must=[
+                                FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+                                FieldCondition(key="todo_id", match=MatchValue(value=todo_id)),
+                                FieldCondition(key="type", match=MatchValue(value="todo_item_direct")),
+                            ]
+                        ),
+                        limit=1,
+                        with_payload=True,
+                    )
+
+                    points, _ = search_result
+                    if not points:
+                        results["not_found"].append(todo_id)
+                        continue
+
+                    # Update the payload to mark as completed
+                    point_id = points[0].id
+                    self._qdrant_client.set_payload(
+                        collection_name=self._collection_name,
+                        points=[point_id],
+                        payload={"completed": True, "completed_at": completion_time},
+                    )
+                    
+                    results["completed"].append({
+                        "todo_id": todo_id,
+                        "title": points[0].payload.get("title", "") if points[0].payload else "",
+                        "completed_at": completion_time
+                    })
+
+                except Exception as e:
+                    logger.error(f"Failed to complete todo {todo_id}: {type(e).__name__}")
+                    results["failed"].append({
+                        "todo_id": todo_id,
+                        "error": str(e)
+                    })
+
+            return results
+
+        except Exception as e:
+            logger.error(f"Failed bulk todo completion: {type(e).__name__}")
+            return {
+                "completed": [],
+                "failed": [{"todo_id": tid, "error": "Bulk operation failed"} for tid in todo_ids],
+                "not_found": []
+            }
+
     def get_todos(
         self,
         user_id: str,
@@ -159,12 +226,11 @@ class UnifiedTodoStorage:
     ) -> List[TodoItem]:
         """Retrieve todos with optional filtering."""
         try:
-            # Build filter conditions - use existing field names from legacy storage
             filter_conditions: List[Condition] = [
                 FieldCondition(key="user_id", match=MatchValue(value=user_id)),
                 FieldCondition(
                     key="type", match=MatchValue(value="todo_item_direct")
-                ),  # Use existing type
+                ), 
             ]
 
             if completed is not None:
@@ -235,6 +301,8 @@ class UnifiedTodoStorage:
             return []
 
 
+
+
 class TodoManagerTool(BaseTool):
     """Simplified todo creation tool with single LLM call and unified storage."""
 
@@ -266,13 +334,17 @@ class TodoManagerTool(BaseTool):
 
     def _extract_todos_structured(self, user_input: str) -> List[Dict[str, Any]]:
         """Extract todos using single structured LLM call."""
+        # Get available todo tags from enum
+        available_tags = TodoTag.get_all_tags()
+        tags_str = ', '.join(available_tags)
+        
         prompt = f"""Extract todo items from: "{user_input}"
 
 Return valid JSON array of objects. Each object must have:
 - title: string (required, max 100 chars)
 - priority: "high", "medium", or "low" 
 - due_date: string or null (tomorrow, today, Friday, etc.)
-- tags: array of strings from [work, personal, home, shopping, health, finance, social, travel, learning, maintenance]
+- tags: array of strings from [{tags_str}]
 
 Examples:
 Input: "buy groceries and call mom tomorrow"
@@ -316,19 +388,8 @@ Output:"""
                         if cleaned_todo["priority"] not in ["high", "medium", "low"]:
                             cleaned_todo["priority"] = "medium"
 
-                        # Validate tags
-                        valid_tags = {
-                            "work",
-                            "personal",
-                            "home",
-                            "shopping",
-                            "health",
-                            "finance",
-                            "social",
-                            "travel",
-                            "learning",
-                            "maintenance",
-                        }
+                        # Validate tags using enum
+                        valid_tags = set(TodoTag.get_all_tags())
                         cleaned_todo["tags"] = [
                             tag for tag in cleaned_todo["tags"] if tag in valid_tags
                         ]
@@ -652,10 +713,194 @@ class CompleteTodoTool(BaseTool):
             )
 
 
+class BulkCompleteTodoTool(BaseTool):
+    """Tool for marking multiple todo items as complete simultaneously."""
+
+    name: str = "bulk_complete_todos"
+    description: str = """Complete multiple todo items at once with detailed results.
+
+    Efficiently handles:
+    - Multiple todo IDs in a single operation
+    - Detailed success/failure reporting per task
+    - Atomic completion with timestamps
+    
+    Use for: "Mark tasks 1, 2, and 3 as done", "Complete all work tasks", "Finish these todos: [ids]"
+    """
+    args_schema: type = BulkCompleteTodoInput
+
+    def __init__(self, memory: Memory, config: AgentConfig, **kwargs):
+        super().__init__(**kwargs)
+        self._memory = memory
+        self._config = config
+        self._storage = UnifiedTodoStorage(config)
+
+    def _run(self, todo_ids: List[str], user_id: str) -> str:
+        """Mark multiple todos as complete using unified storage."""
+        try:
+            # Use unified storage to complete todos in bulk
+            results = self._storage.complete_todos_bulk(todo_ids, user_id)
+
+            # Prepare summary statistics
+            total_requested = len(todo_ids)
+            total_completed = len(results["completed"])
+            total_failed = len(results["failed"])
+            total_not_found = len(results["not_found"])
+
+            # Determine overall status
+            if total_completed == total_requested:
+                status = "success"
+                message = f"Successfully completed all {total_completed} todos"
+            elif total_completed > 0:
+                status = "partial_success"
+                message = f"Completed {total_completed} of {total_requested} todos"
+            else:
+                status = "failed"
+                message = "No todos were completed"
+
+            # Return structured data
+            result_data = {
+                "status": status,
+                "action": "bulk_todo_completion",
+                "user_id": user_id,
+                "message": message,
+                "summary": {
+                    "requested": total_requested,
+                    "completed": total_completed,
+                    "failed": total_failed,
+                    "not_found": total_not_found,
+                },
+                "results": results,
+                "completed_at": datetime.now().isoformat() if total_completed > 0 else None,
+            }
+
+            return json.dumps(result_data, indent=2)
+
+        except Exception as e:
+            logger.error(f"Error in bulk todo completion: {type(e).__name__}")
+            return json.dumps(
+                {
+                    "status": "error",
+                    "action": "bulk_todo_completion_failed",
+                    "user_id": user_id,
+                    "todo_ids": todo_ids,
+                    "error": "Internal bulk completion error",
+                },
+                indent=2,
+            )
+
+
+class UserInfoExtractor:
+    """Extract and store user information from conversations."""
+    
+    def __init__(self, config: AgentConfig):
+        self._config = config
+        self._adapter = create_memory_adapter(config)
+    
+    def extract_and_store_user_info(self, conversation_text: str, user_id: str) -> List[UserInfo]:
+        """Extract user information from conversation and store it."""
+        return self._adapter.extract_and_store_user_info(conversation_text, user_id)
+
+
+class UserMemorySearchTool(BaseTool):
+    """Tool for searching user memories and personal information."""
+
+    name: str = "search_user_memories"
+    description: str = """ALWAYS use this tool when the user asks ANY personal question about themselves.
+
+    REQUIRED for questions like:
+    - "What is my name?" or "Who am I?" → search with "name"
+    - "What do I do for work?" or "What's my job?" → search with "work job"
+    - "What are my preferences?" → search with "preferences"
+    - "Tell me about myself" → search with "personal information"
+    - "What projects am I working on?" → search with "projects"
+    - "What are my hobbies?" → search with "hobbies interests"
+    
+    NEVER answer personal questions without using this tool first. The user expects you to remember their information.
+    """
+    args_schema: type = SearchUserMemoriesInput
+
+    def __init__(self, memory: Memory, config: AgentConfig, **kwargs):
+        super().__init__(**kwargs)
+        self._memory = memory
+        self._config = config
+        self._adapter = create_memory_adapter(config)
+
+    def _run(self, query: str, user_id: str) -> str:
+        """Search user memories and return relevant information."""
+        try:
+            # Search for relevant user information
+            user_infos = self._adapter.search_user_info(user_id, query, limit=10)
+            
+            if not user_infos:
+                return json.dumps({
+                    "status": "no_memories_found",
+                    "message": "No relevant personal information found in your memories",
+                    "query": query,
+                    "user_id": user_id,
+                    "suggestion": "You can share personal information with me and I'll remember it for future conversations."
+                })
+            
+            # Organize results by info type
+            personal_info = []
+            preferences = []
+            projects = []
+            other_info = []
+            
+            for info in user_infos:
+                info_dict = {
+                    "content": info.content,
+                    "relevance_score": info.relevance_score,
+                    "tags": info.tags,
+                    "created_at": info.created_at
+                }
+                
+                if info.info_type == UserInfoType.PERSONAL:
+                    personal_info.append(info_dict)
+                elif info.info_type == UserInfoType.PREFERENCE:
+                    preferences.append(info_dict)
+                elif info.info_type == UserInfoType.PROJECT:
+                    projects.append(info_dict)
+                else:
+                    other_info.append(info_dict)
+            
+            result_data = {
+                "status": "success",
+                "query": query,
+                "user_id": user_id,
+                "total_memories": len(user_infos),
+                "memories": {
+                    "personal": personal_info,
+                    "preferences": preferences,
+                    "projects": projects,
+                    "other": other_info
+                }
+            }
+            
+            return json.dumps(result_data, indent=2)
+            
+        except Exception as e:
+            logger.error(f"Error searching user memories: {type(e).__name__}")
+            return json.dumps({
+                "status": "error",
+                "action": "memory_search_failed",
+                "query": query,
+                "user_id": user_id,
+                "error": "Internal search error"
+            })
+
+
 def create_todo_tools(memory: Memory, config: AgentConfig) -> List[BaseTool]:
     """Create all todo management tools."""
     return [
         TodoManagerTool(memory=memory, config=config),
         ListTodosTool(memory=memory, config=config),
         CompleteTodoTool(memory=memory, config=config),
+        BulkCompleteTodoTool(memory=memory, config=config),
+    ]
+
+
+def create_conversation_tools(memory: Memory, config: AgentConfig) -> List[BaseTool]:
+    """Create tools for conversation chatbot including memory search."""
+    return [
+        UserMemorySearchTool(memory=memory, config=config),
     ]

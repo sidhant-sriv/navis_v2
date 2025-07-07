@@ -14,8 +14,15 @@ from langchain_core.messages import HumanMessage
 
 from src.agent.config import AgentConfig
 from src.agent.state import TodoAgentState
-from src.agent.nodes import chatbot_node, should_continue, MemoryManager
-from src.agent.tools import create_todo_tools
+from src.agent.nodes import (
+    todo_chatbot_node,
+    conversation_chatbot_node,
+    intent_router_node,
+    simple_route_decision,
+    should_continue,
+    MemoryManager,
+)
+from src.agent.tools import create_todo_tools, create_conversation_tools
 
 
 class Configuration(TypedDict):
@@ -39,11 +46,14 @@ def create_todo_graph() -> StateGraph:
     # The actual tools will be created with memory in the chatbot node
     # For now, create a placeholder - the real tools are created in chatbot_node
 
-    # Add the main chatbot node
-    graph.add_node("chatbot", chatbot_node)
+    # Add the intent router node
+    graph.add_node("intent_router", intent_router_node)
+    
+    # Add the todo and conversation chatbot nodes
+    graph.add_node("todo_chatbot", todo_chatbot_node)
+    graph.add_node("conversation_chatbot", conversation_chatbot_node)
 
-    # Add tools node - we'll use a simple approach and create tools with default config
-    # The tools will be re-created in each node call but that's acceptable for this use case
+    # Add tools node - create both todo and conversation tools
     def tools_node(state: TodoAgentState, config: RunnableConfig):
         """Tools node that creates tools with proper memory configuration."""
         configuration = config.get("configurable", {})
@@ -53,20 +63,34 @@ def create_todo_graph() -> StateGraph:
             agent_config = AgentConfig.from_env()
 
         memory_manager = MemoryManager(agent_config)
-        tools = create_todo_tools(memory_manager.memory, agent_config)
+        
+        # Create both sets of tools so either chatbot can use them
+        todo_tools = create_todo_tools(memory_manager.memory, agent_config)
+        conversation_tools = create_conversation_tools(memory_manager.memory, agent_config)
+        all_tools = todo_tools + conversation_tools
 
         # Use ToolNode to execute the tools
-        tool_executor = ToolNode(tools)
+        tool_executor = ToolNode(all_tools)
         return tool_executor.invoke(state, config)
 
     graph.add_node("tools", tools_node)
 
-    # Set up the flow: START -> chatbot
-    graph.add_edge(START, "chatbot")
+    # Set up the flow: START -> intent_router
+    graph.add_edge(START, "intent_router")
 
-    # Add conditional edges from chatbot
+    # Add conditional routing from intent_router
     graph.add_conditional_edges(
-        "chatbot",
+        "intent_router",
+        simple_route_decision,
+        {
+            "todo_chatbot": "todo_chatbot",
+            "conversation_chatbot": "conversation_chatbot",
+        },
+    )
+
+    # Add conditional edges from todo_chatbot
+    graph.add_conditional_edges(
+        "todo_chatbot",
         should_continue,
         {
             "tools": "tools",
@@ -74,8 +98,33 @@ def create_todo_graph() -> StateGraph:
         },
     )
 
-    # After tools, go back to chatbot for final response, but should_continue will determine if we end
-    graph.add_edge("tools", "chatbot")
+    # Add conditional edges from conversation_chatbot (can also use tools now)
+    graph.add_conditional_edges(
+        "conversation_chatbot",
+        should_continue,
+        {
+            "tools": "tools",
+            "__end__": END,
+        },
+    )
+
+    # After tools, check which chatbot to return to based on the last human message intent
+    def tools_return_router(state: TodoAgentState) -> str:
+        """Route back to the appropriate chatbot after tool execution."""
+        detected_intent = state.get("detected_intent", "conversation")
+        if detected_intent == "todo":
+            return "todo_chatbot"
+        else:
+            return "conversation_chatbot"
+
+    graph.add_conditional_edges(
+        "tools",
+        tools_return_router,
+        {
+            "todo_chatbot": "todo_chatbot",
+            "conversation_chatbot": "conversation_chatbot",
+        },
+    )
 
     return graph
 
@@ -105,9 +154,12 @@ async def run_todo_agent(
     initial_state: TodoAgentState = {
         "messages": [HumanMessage(content=user_input)],
         "user_id": user_id,
+        "detected_intent": None,
         "todo_results": None,
         "memory_context": None,
+        "user_context": None,
         "processing_complete": False,
+        "user_info_extracted": False,  # Initialize to prevent duplicates
     }
 
     # Prepare configuration
@@ -133,14 +185,21 @@ async def example_usage():
     # Create configuration from environment
     config = AgentConfig.from_env()
 
-    # Test cases demonstrating different capabilities
+    # Test cases demonstrating routing capabilities
     test_cases = [
+        # Todo operations
         "Add buy groceries and call mom to my todo list",
-        "I need to finish the report by Friday and schedule dentist appointment",
-        "Create todos for: 1. Review code 2. Send email to client 3. Update docs",
+        "I need to finish the report by Friday and schedule dentist appointment", 
         "Show me my current todos",
-        "What todos did I create today?",
-        "Mark todo_0001 as completed",
+        "Mark my first task as completed",
+        # Conversational interactions with personal context sharing
+        "Hello, I'm John and I work as a software engineer at a tech startup",
+        "What can you help me with?",
+        "Tell me about your capabilities",
+        "Hi there!",
+        # Memory-based questions
+        "What is my name?",
+        "What do I do for work?",
     ]
 
     user_id = "test_user_123"
