@@ -231,3 +231,10 @@ class ExtractUserInfoInput(BaseModel):
     
     conversation_text: str = Field(description="The conversation text to analyze")
     user_id: str = Field(description="User identifier")
+
+
+class SearchUserMemoriesInput(BaseModel):
+    """Input for searching user memories."""
+    
+    query: str = Field(description="Search query to find relevant user information")
+    user_id: str = Field(description="User identifier")
