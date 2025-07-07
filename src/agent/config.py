@@ -28,7 +28,7 @@ class QdrantConfig:
 class OllamaConfig:
     """Configuration for Ollama LLM."""
 
-    model: str = "llama3.1:8b"
+    model: str = "qwen2.5:14b"
     base_url: str = "http://localhost:11434"
     temperature: float = 0.1
     max_tokens: int = 2048

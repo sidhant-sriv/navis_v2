@@ -30,6 +30,7 @@ from src.agent.models import (
     CreateTodosInput,
     ListTodosInput,
     CompleteTodoInput,
+    BulkCompleteTodoInput,
     ExtractUserInfoInput,
 )
 from src.agent.config import AgentConfig
@@ -131,14 +132,12 @@ class UnifiedTodoStorage:
             content = f"Todo: {todo.title} - {todo.description} - Priority: {todo.priority} - Tags: {','.join(todo.tags)}"
             embedding = self._get_embedding(content)
 
-            # Generate UUID for point ID (Qdrant requirement)
             point_uuid = str(uuid.uuid4())
 
-            # Use legacy-compatible payload structure
             payload = {
-                "type": "todo_item_direct",  # Match existing type
+                "type": "todo_item_direct",
                 "user_id": user_id,
-                "todo_id": todo.id,  # Use separate field for todo ID
+                "todo_id": todo.id,
                 "title": todo.title,
                 "description": todo.description,
                 "priority": todo.priority,
@@ -147,11 +146,11 @@ class UnifiedTodoStorage:
                 "completed_at": todo.completed_at,
                 "created_at": todo.created_at,
                 "tags": todo.tags,
-                "content": content,  # For searchability
+                "content": content,
             }
 
             point = PointStruct(
-                id=point_uuid,  # Use UUID for point ID
+                id=point_uuid,
                 vector=embedding,
                 payload=payload,
             )
@@ -207,6 +206,68 @@ class UnifiedTodoStorage:
             logger.error(f"Failed to complete todo: {type(e).__name__}")
             return False
 
+    def complete_todos_bulk(self, todo_ids: List[str], user_id: str) -> Dict[str, Any]:
+        """Mark multiple todos as completed in a batch operation."""
+        completion_time = datetime.now().isoformat()
+        results = {
+            "completed": [],
+            "failed": [],
+            "not_found": []
+        }
+        
+        try:
+            for todo_id in todo_ids:
+                try:
+                    # Find the todo
+                    search_result = self._qdrant_client.scroll(
+                        collection_name=self._collection_name,
+                        scroll_filter=Filter(
+                            must=[
+                                FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+                                FieldCondition(key="todo_id", match=MatchValue(value=todo_id)),
+                                FieldCondition(key="type", match=MatchValue(value="todo_item_direct")),
+                            ]
+                        ),
+                        limit=1,
+                        with_payload=True,
+                    )
+
+                    points, _ = search_result
+                    if not points:
+                        results["not_found"].append(todo_id)
+                        continue
+
+                    # Update the payload to mark as completed
+                    point_id = points[0].id
+                    self._qdrant_client.set_payload(
+                        collection_name=self._collection_name,
+                        points=[point_id],
+                        payload={"completed": True, "completed_at": completion_time},
+                    )
+                    
+                    results["completed"].append({
+                        "todo_id": todo_id,
+                        "title": points[0].payload.get("title", "") if points[0].payload else "",
+                        "completed_at": completion_time
+                    })
+
+                except Exception as e:
+                    logger.error(f"Failed to complete todo {todo_id}: {type(e).__name__}")
+                    results["failed"].append({
+                        "todo_id": todo_id,
+                        "error": str(e)
+                    })
+
+            return results
+
+        except Exception as e:
+            logger.error(f"Failed bulk todo completion: {type(e).__name__}")
+            return {
+                "completed": [],
+                "failed": [{"todo_id": tid, "error": "Bulk operation failed"} for tid in todo_ids],
+                "not_found": []
+            }
+
     def get_todos(
         self,
         user_id: str,
@@ -217,12 +278,11 @@ class UnifiedTodoStorage:
     ) -> List[TodoItem]:
         """Retrieve todos with optional filtering."""
         try:
-            # Build filter conditions - use existing field names from legacy storage
             filter_conditions: List[Condition] = [
                 FieldCondition(key="user_id", match=MatchValue(value=user_id)),
                 FieldCondition(
                     key="type", match=MatchValue(value="todo_item_direct")
-                ),  # Use existing type
+                ), 
             ]
 
             if completed is not None:
@@ -903,6 +963,82 @@ class CompleteTodoTool(BaseTool):
             )
 
 
+class BulkCompleteTodoTool(BaseTool):
+    """Tool for marking multiple todo items as complete simultaneously."""
+
+    name: str = "bulk_complete_todos"
+    description: str = """Complete multiple todo items at once with detailed results.
+
+    Efficiently handles:
+    - Multiple todo IDs in a single operation
+    - Detailed success/failure reporting per task
+    - Atomic completion with timestamps
+    
+    Use for: "Mark tasks 1, 2, and 3 as done", "Complete all work tasks", "Finish these todos: [ids]"
+    """
+    args_schema: type = BulkCompleteTodoInput
+
+    def __init__(self, memory: Memory, config: AgentConfig, **kwargs):
+        super().__init__(**kwargs)
+        self._memory = memory
+        self._config = config
+        self._storage = UnifiedTodoStorage(config)
+
+    def _run(self, todo_ids: List[str], user_id: str) -> str:
+        """Mark multiple todos as complete using unified storage."""
+        try:
+            # Use unified storage to complete todos in bulk
+            results = self._storage.complete_todos_bulk(todo_ids, user_id)
+
+            # Prepare summary statistics
+            total_requested = len(todo_ids)
+            total_completed = len(results["completed"])
+            total_failed = len(results["failed"])
+            total_not_found = len(results["not_found"])
+
+            # Determine overall status
+            if total_completed == total_requested:
+                status = "success"
+                message = f"Successfully completed all {total_completed} todos"
+            elif total_completed > 0:
+                status = "partial_success"
+                message = f"Completed {total_completed} of {total_requested} todos"
+            else:
+                status = "failed"
+                message = "No todos were completed"
+
+            # Return structured data
+            result_data = {
+                "status": status,
+                "action": "bulk_todo_completion",
+                "user_id": user_id,
+                "message": message,
+                "summary": {
+                    "requested": total_requested,
+                    "completed": total_completed,
+                    "failed": total_failed,
+                    "not_found": total_not_found,
+                },
+                "results": results,
+                "completed_at": datetime.now().isoformat() if total_completed > 0 else None,
+            }
+
+            return json.dumps(result_data, indent=2)
+
+        except Exception as e:
+            logger.error(f"Error in bulk todo completion: {type(e).__name__}")
+            return json.dumps(
+                {
+                    "status": "error",
+                    "action": "bulk_todo_completion_failed",
+                    "user_id": user_id,
+                    "todo_ids": todo_ids,
+                    "error": "Internal bulk completion error",
+                },
+                indent=2,
+            )
+
+
 class UserInfoExtractor:
     """Extract and store user information from conversations."""
     
@@ -1114,6 +1250,7 @@ def create_todo_tools(memory: Memory, config: AgentConfig) -> List[BaseTool]:
         TodoManagerTool(memory=memory, config=config),
         ListTodosTool(memory=memory, config=config),
         CompleteTodoTool(memory=memory, config=config),
+        BulkCompleteTodoTool(memory=memory, config=config),
     ]
 
 

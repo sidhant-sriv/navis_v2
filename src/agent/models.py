@@ -201,6 +201,31 @@ class CompleteTodoInput(BaseModel):
     user_id: str = Field(description="User identifier")
 
 
+class BulkCompleteTodoInput(BaseModel):
+    """Input for completing multiple todo items at once."""
+
+    todo_ids: List[str] = Field(
+        description="List of todo item IDs to mark as complete",
+        min_length=1
+    )
+    user_id: str = Field(description="User identifier")
+
+    @field_validator("todo_ids")
+    def validate_todo_ids(cls, v):
+        if not v:
+            raise ValueError("At least one todo ID must be provided")
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_ids = []
+        for todo_id in v:
+            if todo_id and todo_id.strip() and todo_id not in seen:
+                seen.add(todo_id)
+                unique_ids.append(todo_id.strip())
+        if not unique_ids:
+            raise ValueError("At least one valid todo ID must be provided")
+        return unique_ids
+
+
 class ExtractUserInfoInput(BaseModel):
     """Input for extracting user information from conversation."""
     
