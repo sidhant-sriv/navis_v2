@@ -349,6 +349,7 @@ async def todo_chatbot_node(
                 # Better regex that can handle nested braces
                 json_match = re.search(r'\{.*?"name".*?\}', content, re.DOTALL)
                 if json_match:
+                    potential_json = None
                     try:
                         potential_json = json_match.group(0)
                         (f"DEBUG: Found potential JSON: {potential_json}")
@@ -374,7 +375,9 @@ async def todo_chatbot_node(
                                 f"DEBUG: Parsed fallback JSON (no brace counting): {tool_data}"
                             )
                     except json.JSONDecodeError as e:
-                        (f"Failed to parse fallback JSON: {potential_json}, error: {e}")
+                        # potential_json may be None if an error occurred before assignment
+                        safe_json = potential_json if potential_json is not None else "<unavailable>"
+                        logging.debug(f"Failed to parse fallback JSON: {safe_json}, error: {e}")
                         tool_data = None
 
                 # Last resort: try parsing the entire content if it looks like JSON
