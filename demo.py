@@ -12,8 +12,9 @@ Usage:
 
 import asyncio
 import os
-from src.agent.graph import run_todo_agent
+
 from src.agent.config import AgentConfig
+from src.agent.graph import run_todo_agent
 
 
 async def demo_todo_agent():

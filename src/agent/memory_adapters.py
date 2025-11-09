@@ -1,14 +1,15 @@
 """Adapters to bridge the new memory system with existing todo functionality."""
 
-from typing import List, Optional, Dict, Any
-from src.agent.memory import MemoryManager, MemoryConfig, MemoryItem
-from src.agent.models import UserInfo, UserContext, UserInfoType, UserInfoTag
+from typing import Any, Dict, List, Optional
+
 from src.agent.config import AgentConfig
+from src.agent.memory import MemoryConfig, MemoryItem, MemoryManager
+from src.agent.models import UserContext, UserInfo, UserInfoTag, UserInfoType
 
 
 class TodoMemoryAdapter:
     """Adapter that bridges the new memory system with todo functionality."""
-    
+
     def __init__(self, agent_config: AgentConfig):
         # Convert AgentConfig to MemoryConfig
         memory_config = MemoryConfig(
@@ -24,20 +25,24 @@ class TodoMemoryAdapter:
             llm_temperature=agent_config.ollama.temperature,
             llm_max_tokens=agent_config.ollama.max_tokens,
         )
-        
+
         self._memory = MemoryManager(memory_config)
         self._todo_collection = agent_config.qdrant.todo_collection_name
         self._user_profile_collection = agent_config.qdrant.user_profile_collection_name
-        
+
         # Register collections
-        self._memory.register_collection(self._todo_collection, "Todo items and task management")
-        self._memory.register_collection(self._user_profile_collection, "User personal information and preferences")
-    
+        self._memory.register_collection(
+            self._todo_collection, "Todo items and task management"
+        )
+        self._memory.register_collection(
+            self._user_profile_collection, "User personal information and preferences"
+        )
+
     @property
     def memory_manager(self) -> MemoryManager:
         """Access the underlying memory manager."""
         return self._memory
-    
+
     def store_user_info(self, user_info: UserInfo) -> bool:
         """Store user info using the new memory system."""
         memory_item = MemoryItem(
@@ -53,44 +58,52 @@ class TodoMemoryAdapter:
             created_at=user_info.created_at,
             last_used=user_info.last_used,
         )
-        
+
         return self._memory.store(memory_item, self._user_profile_collection)
-    
-    def search_user_info(self, user_id: str, query: str, limit: int = 10) -> List[UserInfo]:
+
+    def search_user_info(
+        self, user_id: str, query: str, limit: int = 10
+    ) -> List[UserInfo]:
         """Search user info using the new memory system."""
-        memory_items = self._memory.search(user_id, query, self._user_profile_collection, limit=limit)
-        
+        memory_items = self._memory.search(
+            user_id, query, self._user_profile_collection, limit=limit
+        )
+
         return [self._memory_item_to_user_info(item) for item in memory_items]
-    
+
     def get_user_context(self, user_id: str, limit: int = 20) -> UserContext:
         """Get user context using the new memory system."""
-        memory_items = self._memory.get_all(user_id, self._user_profile_collection, limit=limit)
-        
+        memory_items = self._memory.get_all(
+            user_id, self._user_profile_collection, limit=limit
+        )
+
         user_context = UserContext(user_id=user_id)
         for item in memory_items:
             user_info = self._memory_item_to_user_info(item)
             user_context.add_info(user_info)
-        
+
         return user_context
-    
-    def extract_and_store_user_info(self, conversation_text: str, user_id: str) -> List[UserInfo]:
+
+    def extract_and_store_user_info(
+        self, conversation_text: str, user_id: str
+    ) -> List[UserInfo]:
         """Extract user info from conversation using the new memory system."""
         extraction_schema = {
             "types": UserInfoType.get_all_types(),
             "tags": UserInfoTag.get_all_tags(),
         }
-        
+
         memory_items = self._memory.extract_and_store(
             text=conversation_text,
             user_id=user_id,
             collection_name=self._user_profile_collection,
             extraction_schema=extraction_schema,
             context="Todo management conversation",
-            dedup_limit=5
+            dedup_limit=5,
         )
-        
+
         return [self._memory_item_to_user_info(item) for item in memory_items]
-    
+
     def _memory_item_to_user_info(self, memory_item: MemoryItem) -> UserInfo:
         """Convert MemoryItem to UserInfo."""
         # Parse info_type from string to enum
@@ -98,7 +111,7 @@ class TodoMemoryAdapter:
             info_type = UserInfoType(memory_item.item_type)
         except ValueError:
             info_type = UserInfoType.PERSONAL
-        
+
         return UserInfo(
             id=memory_item.id,
             user_id=memory_item.user_id,
@@ -113,4 +126,4 @@ class TodoMemoryAdapter:
 
 def create_memory_adapter(agent_config: AgentConfig) -> TodoMemoryAdapter:
     """Factory function to create memory adapter."""
-    return TodoMemoryAdapter(agent_config) 
+    return TodoMemoryAdapter(agent_config)

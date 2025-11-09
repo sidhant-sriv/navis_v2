@@ -7,22 +7,23 @@ following best practices from: https://langchain-ai.github.io/langgraph/tutorial
 from __future__ import annotations
 
 from typing import Any, Dict, Optional, TypedDict
-from langchain_core.runnables import RunnableConfig
-from langgraph.graph import StateGraph, START, END
-from langgraph.prebuilt import ToolNode
+
 from langchain_core.messages import HumanMessage
+from langchain_core.runnables import RunnableConfig
+from langgraph.graph import END, START, StateGraph
+from langgraph.prebuilt import ToolNode
 
 from src.agent.config import AgentConfig
-from src.agent.state import TodoAgentState
 from src.agent.nodes import (
-    todo_chatbot_node,
+    MemoryManager,
     conversation_chatbot_node,
     intent_router_node,
-    simple_route_decision,
     should_continue,
-    MemoryManager,
+    simple_route_decision,
+    todo_chatbot_node,
 )
-from src.agent.tools import create_todo_tools, create_conversation_tools
+from src.agent.state import TodoAgentState
+from src.agent.tools import create_conversation_tools, create_todo_tools
 
 
 class Configuration(TypedDict):
@@ -48,7 +49,7 @@ def create_todo_graph() -> StateGraph:
 
     # Add the intent router node
     graph.add_node("intent_router", intent_router_node)
-    
+
     # Add the todo and conversation chatbot nodes
     graph.add_node("todo_chatbot", todo_chatbot_node)
     graph.add_node("conversation_chatbot", conversation_chatbot_node)
@@ -63,10 +64,12 @@ def create_todo_graph() -> StateGraph:
             agent_config = AgentConfig.from_env()
 
         memory_manager = MemoryManager(agent_config)
-        
+
         # Create both sets of tools so either chatbot can use them
         todo_tools = create_todo_tools(memory_manager.memory, agent_config)
-        conversation_tools = create_conversation_tools(memory_manager.memory, agent_config)
+        conversation_tools = create_conversation_tools(
+            memory_manager.memory, agent_config
+        )
         all_tools = todo_tools + conversation_tools
 
         # Use ToolNode to execute the tools
@@ -189,7 +192,7 @@ async def example_usage():
     test_cases = [
         # Todo operations
         "Add buy groceries and call mom to my todo list",
-        "I need to finish the report by Friday and schedule dentist appointment", 
+        "I need to finish the report by Friday and schedule dentist appointment",
         "Show me my current todos",
         "Mark my first task as completed",
         # Conversational interactions with personal context sharing

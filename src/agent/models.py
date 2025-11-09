@@ -1,18 +1,20 @@
-from typing import List, Optional, Dict, Any
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from pydantic import field_validator, BaseModel, Field
+from typing import Any, Dict, List, Optional
+
+from pydantic import BaseModel, Field, field_validator
 
 
 class UserInfoType(Enum):
     """Types of user information that can be stored."""
+
     PERSONAL = "personal"
     PREFERENCE = "preference"
     PROJECT = "project"
     SCHEDULE = "schedule"
     HABIT = "habit"
-    
+
     @classmethod
     def get_all_types(cls) -> List[str]:
         """Get all available info types as strings."""
@@ -21,6 +23,7 @@ class UserInfoType(Enum):
 
 class TodoTag(Enum):
     """Available tags for todo items."""
+
     WORK = "work"
     PERSONAL = "personal"
     HOME = "home"
@@ -31,7 +34,7 @@ class TodoTag(Enum):
     TRAVEL = "travel"
     LEARNING = "learning"
     MAINTENANCE = "maintenance"
-    
+
     @classmethod
     def get_all_tags(cls) -> List[str]:
         """Get all available todo tags as strings."""
@@ -40,6 +43,7 @@ class TodoTag(Enum):
 
 class UserInfoTag(Enum):
     """Available tags for user information."""
+
     WORK = "work"
     PERSONAL = "personal"
     HEALTH = "health"
@@ -47,7 +51,7 @@ class UserInfoTag(Enum):
     HOBBY = "hobby"
     SCHEDULE = "schedule"
     PRIORITY = "priority"
-    
+
     @classmethod
     def get_all_tags(cls) -> List[str]:
         """Get all available user info tags as strings."""
@@ -90,7 +94,7 @@ class TodoItem:
 @dataclass
 class UserInfo:
     """User information and context for enhanced todo creation."""
-    
+
     id: str
     user_id: str
     info_type: UserInfoType  # Type of information being stored
@@ -99,17 +103,21 @@ class UserInfo:
     tags: List[str] = field(default_factory=list)
     created_at: str = ""
     last_used: Optional[str] = None
-    
+
     def __post_init__(self):
         if not self.created_at:
             self.created_at = datetime.now().isoformat()
-    
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for storage."""
         return {
             "id": self.id,
             "user_id": self.user_id,
-            "info_type": self.info_type.value if isinstance(self.info_type, UserInfoType) else self.info_type,
+            "info_type": (
+                self.info_type.value
+                if isinstance(self.info_type, UserInfoType)
+                else self.info_type
+            ),
             "content": self.content,
             "relevance_score": self.relevance_score,
             "tags": self.tags,
@@ -121,37 +129,41 @@ class UserInfo:
 @dataclass
 class UserContext:
     """Aggregated user context for todo creation."""
-    
+
     user_id: str
     info_by_type: Dict[UserInfoType, List[UserInfo]] = field(default_factory=dict)
-    
+
     def add_info(self, user_info: UserInfo) -> None:
         """Add user information, organizing by type."""
         if user_info.info_type not in self.info_by_type:
             self.info_by_type[user_info.info_type] = []
         self.info_by_type[user_info.info_type].append(user_info)
-    
+
     def get_info_by_type(self, info_type: UserInfoType) -> List[UserInfo]:
         """Get all information of a specific type."""
         return self.info_by_type.get(info_type, [])
-    
+
     def get_context_summary(self, max_per_type: int = 3) -> str:
         """Get a text summary of user context for LLM prompts."""
         context_parts = []
-        
+
         for info_type, infos in self.info_by_type.items():
             if infos:
                 # Sort by relevance score and take top items
-                sorted_infos = sorted(infos, key=lambda x: x.relevance_score, reverse=True)
+                sorted_infos = sorted(
+                    infos, key=lambda x: x.relevance_score, reverse=True
+                )
                 top_infos = sorted_infos[:max_per_type]
-                
+
                 content_list = [info.content for info in top_infos]
                 if content_list:
                     # Capitalize the first letter of the type name
                     type_name = info_type.value.capitalize()
                     context_parts.append(f"{type_name}: {', '.join(content_list)}")
-        
-        return " | ".join(context_parts) if context_parts else "No user context available"
+
+        return (
+            " | ".join(context_parts) if context_parts else "No user context available"
+        )
 
 
 class CreateTodosInput(BaseModel):
@@ -205,8 +217,7 @@ class BulkCompleteTodoInput(BaseModel):
     """Input for completing multiple todo items at once."""
 
     todo_ids: List[str] = Field(
-        description="List of todo item IDs to mark as complete",
-        min_length=1
+        description="List of todo item IDs to mark as complete", min_length=1
     )
     user_id: str = Field(description="User identifier")
 
@@ -228,13 +239,13 @@ class BulkCompleteTodoInput(BaseModel):
 
 class ExtractUserInfoInput(BaseModel):
     """Input for extracting user information from conversation."""
-    
+
     conversation_text: str = Field(description="The conversation text to analyze")
     user_id: str = Field(description="User identifier")
 
 
 class SearchUserMemoriesInput(BaseModel):
     """Input for searching user memories."""
-    
+
     query: str = Field(description="Search query to find relevant user information")
     user_id: str = Field(description="User identifier")

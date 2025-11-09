@@ -4,9 +4,10 @@ Test script for Qdrant vector search with Ollama embeddings.
 Demonstrates the complete workflow of getting embeddings and searching.
 """
 
-import requests
 import sys
-from typing import List, Dict, Any
+from typing import Any, Dict, List
+
+import requests
 
 # Configuration
 OLLAMA_BASE_URL = "http://localhost:11434"

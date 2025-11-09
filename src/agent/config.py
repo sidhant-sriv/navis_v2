@@ -1,8 +1,8 @@
 """Configuration for the todo agent."""
 
-from typing import Optional, Dict, Any
-from dataclasses import dataclass
 import os
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
 
 
 @dataclass
@@ -16,7 +16,7 @@ class QdrantConfig:
     vector_size: int = 1024  # Match mxbai-embed-large dimensions
     api_key: Optional[str] = None
     url: Optional[str] = None
-    
+
     # Legacy property for backward compatibility
     @property
     def collection_name(self) -> str:
@@ -40,7 +40,7 @@ class Mem0Config:
 
     history_db_path: str = "./mem0_history.db"
     version: str = "v1.1"
-    embedding_model: str = "ollama/bge-m3:latest"
+    embedding_model: str = "bge-m3:latest"
 
 
 @dataclass
@@ -58,8 +58,12 @@ class AgentConfig:
             qdrant=QdrantConfig(
                 host=os.getenv("QDRANT_HOST", "localhost"),
                 port=int(os.getenv("QDRANT_PORT", "6333")),
-                todo_collection_name=os.getenv("QDRANT_TODO_COLLECTION", "todo_memories"),
-                user_profile_collection_name=os.getenv("QDRANT_USER_PROFILE_COLLECTION", "user_profiles"),
+                todo_collection_name=os.getenv(
+                    "QDRANT_TODO_COLLECTION", "todo_memories"
+                ),
+                user_profile_collection_name=os.getenv(
+                    "QDRANT_USER_PROFILE_COLLECTION", "user_profiles"
+                ),
                 api_key=os.getenv("QDRANT_API_KEY"),
                 url=os.getenv("QDRANT_URL"),
             ),
@@ -72,9 +76,7 @@ class AgentConfig:
             mem0=Mem0Config(
                 history_db_path=os.getenv("MEM0_HISTORY_PATH", "./mem0_history.db"),
                 version=os.getenv("MEM0_VERSION", "v1.1"),
-                embedding_model=os.getenv(
-                    "MEM0_EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
-                ),
+                embedding_model="bge-m3:latest",  # Hardcoded embedding model
             ),
         )
 

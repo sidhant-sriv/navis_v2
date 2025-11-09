@@ -1,40 +1,41 @@
 """Tools for todo management with unified storage and simplified architecture."""
 
-from typing import List, Optional, Dict, Any
-from datetime import datetime
 import json
-import re
 import logging
+import re
 import uuid
-from langchain_core.tools import BaseTool
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+import requests
 from langchain.chat_models import init_chat_model
+from langchain_core.tools import BaseTool
 from mem0 import Memory
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
-    PointStruct,
-    Filter,
-    FieldCondition,
-    MatchValue,
-    UpdateStatus,
     Condition,
+    FieldCondition,
+    Filter,
+    MatchValue,
+    PointStruct,
+    UpdateStatus,
 )
-from src.agent.models import (
-    TodoItem,
-    UserInfo,
-    UserInfoType,
-    TodoTag,
-    CreateTodosInput,
-    ListTodosInput,
-    CompleteTodoInput,
-    BulkCompleteTodoInput,
-    SearchUserMemoriesInput,
-)
+
 from src.agent.config import AgentConfig
 from src.agent.memory_adapters import create_memory_adapter
-import requests
+from src.agent.models import (
+    BulkCompleteTodoInput,
+    CompleteTodoInput,
+    CreateTodosInput,
+    ListTodosInput,
+    SearchUserMemoriesInput,
+    TodoItem,
+    TodoTag,
+    UserInfo,
+    UserInfoType,
+)
 
 logger = logging.getLogger(__name__)
-
 
 
 class UnifiedTodoStorage:
@@ -42,19 +43,17 @@ class UnifiedTodoStorage:
 
     def __init__(self, config: AgentConfig):
         self._config = config
-        
+
         # Initialize Qdrant client with config values
         if config.qdrant.url:
             # Use cloud/remote URL if available
             self._qdrant_client = QdrantClient(
-                url=config.qdrant.url,
-                api_key=config.qdrant.api_key
+                url=config.qdrant.url, api_key=config.qdrant.api_key
             )
         else:
             # Use local host/port
             self._qdrant_client = QdrantClient(
-                host=config.qdrant.host,
-                port=config.qdrant.port
+                host=config.qdrant.host, port=config.qdrant.port
             )
         self._embedding_url = f"{config.ollama.base_url}/api/embeddings"
         self._collection_name = config.qdrant.todo_collection_name
@@ -65,8 +64,8 @@ class UnifiedTodoStorage:
         """Get embedding for text using Ollama."""
         try:
             response = requests.post(
-                self._embedding_url, 
-                json={"model": self._embedding_model, "prompt": text}
+                self._embedding_url,
+                json={"model": self._embedding_model, "prompt": text},
             )
             response.raise_for_status()
             return response.json()["embedding"]
@@ -125,7 +124,9 @@ class UnifiedTodoStorage:
                     must=[
                         FieldCondition(key="user_id", match=MatchValue(value=user_id)),
                         FieldCondition(key="todo_id", match=MatchValue(value=todo_id)),
-                        FieldCondition(key="type", match=MatchValue(value="todo_item_direct")),
+                        FieldCondition(
+                            key="type", match=MatchValue(value="todo_item_direct")
+                        ),
                     ]
                 ),
                 limit=1,
@@ -157,12 +158,8 @@ class UnifiedTodoStorage:
     def complete_todos_bulk(self, todo_ids: List[str], user_id: str) -> Dict[str, Any]:
         """Mark multiple todos as completed in a batch operation."""
         completion_time = datetime.now().isoformat()
-        results = {
-            "completed": [],
-            "failed": [],
-            "not_found": []
-        }
-        
+        results = {"completed": [], "failed": [], "not_found": []}
+
         try:
             for todo_id in todo_ids:
                 try:
@@ -171,9 +168,16 @@ class UnifiedTodoStorage:
                         collection_name=self._collection_name,
                         scroll_filter=Filter(
                             must=[
-                                FieldCondition(key="user_id", match=MatchValue(value=user_id)),
-                                FieldCondition(key="todo_id", match=MatchValue(value=todo_id)),
-                                FieldCondition(key="type", match=MatchValue(value="todo_item_direct")),
+                                FieldCondition(
+                                    key="user_id", match=MatchValue(value=user_id)
+                                ),
+                                FieldCondition(
+                                    key="todo_id", match=MatchValue(value=todo_id)
+                                ),
+                                FieldCondition(
+                                    key="type",
+                                    match=MatchValue(value="todo_item_direct"),
+                                ),
                             ]
                         ),
                         limit=1,
@@ -192,19 +196,24 @@ class UnifiedTodoStorage:
                         points=[point_id],
                         payload={"completed": True, "completed_at": completion_time},
                     )
-                    
-                    results["completed"].append({
-                        "todo_id": todo_id,
-                        "title": points[0].payload.get("title", "") if points[0].payload else "",
-                        "completed_at": completion_time
-                    })
+
+                    results["completed"].append(
+                        {
+                            "todo_id": todo_id,
+                            "title": (
+                                points[0].payload.get("title", "")
+                                if points[0].payload
+                                else ""
+                            ),
+                            "completed_at": completion_time,
+                        }
+                    )
 
                 except Exception as e:
-                    logger.error(f"Failed to complete todo {todo_id}: {type(e).__name__}")
-                    results["failed"].append({
-                        "todo_id": todo_id,
-                        "error": str(e)
-                    })
+                    logger.error(
+                        f"Failed to complete todo {todo_id}: {type(e).__name__}"
+                    )
+                    results["failed"].append({"todo_id": todo_id, "error": str(e)})
 
             return results
 
@@ -212,8 +221,11 @@ class UnifiedTodoStorage:
             logger.error(f"Failed bulk todo completion: {type(e).__name__}")
             return {
                 "completed": [],
-                "failed": [{"todo_id": tid, "error": "Bulk operation failed"} for tid in todo_ids],
-                "not_found": []
+                "failed": [
+                    {"todo_id": tid, "error": "Bulk operation failed"}
+                    for tid in todo_ids
+                ],
+                "not_found": [],
             }
 
     def get_todos(
@@ -228,9 +240,7 @@ class UnifiedTodoStorage:
         try:
             filter_conditions: List[Condition] = [
                 FieldCondition(key="user_id", match=MatchValue(value=user_id)),
-                FieldCondition(
-                    key="type", match=MatchValue(value="todo_item_direct")
-                ), 
+                FieldCondition(key="type", match=MatchValue(value="todo_item_direct")),
             ]
 
             if completed is not None:
@@ -301,8 +311,6 @@ class UnifiedTodoStorage:
             return []
 
 
-
-
 class TodoManagerTool(BaseTool):
     """Simplified todo creation tool with single LLM call and unified storage."""
 
@@ -325,19 +333,19 @@ class TodoManagerTool(BaseTool):
         self._config = config
         self._storage = UnifiedTodoStorage(config)
         self._llm = init_chat_model(
-            model=config.ollama.model, 
+            model=config.ollama.model,
             model_provider="ollama",
             base_url=config.ollama.base_url,
             temperature=config.ollama.temperature,
-            max_tokens=config.ollama.max_tokens
+            max_tokens=config.ollama.max_tokens,
         )
 
     def _extract_todos_structured(self, user_input: str) -> List[Dict[str, Any]]:
         """Extract todos using single structured LLM call."""
         # Get available todo tags from enum
         available_tags = TodoTag.get_all_tags()
-        tags_str = ', '.join(available_tags)
-        
+        tags_str = ", ".join(available_tags)
+
         prompt = f"""Extract todo items from: "{user_input}"
 
 Return valid JSON array of objects. Each object must have:
@@ -770,7 +778,9 @@ class BulkCompleteTodoTool(BaseTool):
                     "not_found": total_not_found,
                 },
                 "results": results,
-                "completed_at": datetime.now().isoformat() if total_completed > 0 else None,
+                "completed_at": (
+                    datetime.now().isoformat() if total_completed > 0 else None
+                ),
             }
 
             return json.dumps(result_data, indent=2)
@@ -791,12 +801,14 @@ class BulkCompleteTodoTool(BaseTool):
 
 class UserInfoExtractor:
     """Extract and store user information from conversations."""
-    
+
     def __init__(self, config: AgentConfig):
         self._config = config
         self._adapter = create_memory_adapter(config)
-    
-    def extract_and_store_user_info(self, conversation_text: str, user_id: str) -> List[UserInfo]:
+
+    def extract_and_store_user_info(
+        self, conversation_text: str, user_id: str
+    ) -> List[UserInfo]:
         """Extract user information from conversation and store it."""
         return self._adapter.extract_and_store_user_info(conversation_text, user_id)
 
@@ -830,30 +842,32 @@ class UserMemorySearchTool(BaseTool):
         try:
             # Search for relevant user information
             user_infos = self._adapter.search_user_info(user_id, query, limit=10)
-            
+
             if not user_infos:
-                return json.dumps({
-                    "status": "no_memories_found",
-                    "message": "No relevant personal information found in your memories",
-                    "query": query,
-                    "user_id": user_id,
-                    "suggestion": "You can share personal information with me and I'll remember it for future conversations."
-                })
-            
+                return json.dumps(
+                    {
+                        "status": "no_memories_found",
+                        "message": "No relevant personal information found in your memories",
+                        "query": query,
+                        "user_id": user_id,
+                        "suggestion": "You can share personal information with me and I'll remember it for future conversations.",
+                    }
+                )
+
             # Organize results by info type
             personal_info = []
             preferences = []
             projects = []
             other_info = []
-            
+
             for info in user_infos:
                 info_dict = {
                     "content": info.content,
                     "relevance_score": info.relevance_score,
                     "tags": info.tags,
-                    "created_at": info.created_at
+                    "created_at": info.created_at,
                 }
-                
+
                 if info.info_type == UserInfoType.PERSONAL:
                     personal_info.append(info_dict)
                 elif info.info_type == UserInfoType.PREFERENCE:
@@ -862,7 +876,7 @@ class UserMemorySearchTool(BaseTool):
                     projects.append(info_dict)
                 else:
                     other_info.append(info_dict)
-            
+
             result_data = {
                 "status": "success",
                 "query": query,
@@ -872,21 +886,23 @@ class UserMemorySearchTool(BaseTool):
                     "personal": personal_info,
                     "preferences": preferences,
                     "projects": projects,
-                    "other": other_info
-                }
+                    "other": other_info,
+                },
             }
-            
+
             return json.dumps(result_data, indent=2)
-            
+
         except Exception as e:
             logger.error(f"Error searching user memories: {type(e).__name__}")
-            return json.dumps({
-                "status": "error",
-                "action": "memory_search_failed",
-                "query": query,
-                "user_id": user_id,
-                "error": "Internal search error"
-            })
+            return json.dumps(
+                {
+                    "status": "error",
+                    "action": "memory_search_failed",
+                    "query": query,
+                    "user_id": user_id,
+                    "error": "Internal search error",
+                }
+            )
 
 
 def create_todo_tools(memory: Memory, config: AgentConfig) -> List[BaseTool]:

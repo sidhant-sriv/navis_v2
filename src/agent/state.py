@@ -1,6 +1,7 @@
 """State definition for the todo agent following LangGraph best practices."""
 
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict
+
 from langgraph.graph import MessagesState
 
 
@@ -18,19 +19,17 @@ class TodoAgentState(MessagesState):
     user_id: str
 
     # Intent routing - for determining conversation vs todo operations
-    detected_intent: Optional[str]  # "todo" or "conversation"
-
+    detected_intent: str | None  # "todo" or "conversation"
     # Todo processing results - simplified from complex extraction
-    todo_results: Optional[Dict[str, Any]]
+    todo_results: Dict[str, Any] | None
 
     # Memory integration - for context and retrieval
-    memory_context: Optional[str]
-    
-    # User context - for enhanced todo creation
-    user_context: Optional[str]  # Summary of user information for context-aware todos
+    memory_context: str | None
 
+    # User context - for enhanced todo creation
+    user_context: str | None  # Summary of user information for context-aware todos
     # Processing status - simpler than multiple flags
     processing_complete: bool
-    
+
     # User info extraction tracking - to prevent duplicates
-    user_info_extracted: Optional[bool]
+    user_info_extracted: bool | None
